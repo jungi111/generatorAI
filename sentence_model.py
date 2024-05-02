@@ -185,7 +185,7 @@ def get_sentence_by_level(step_no):
             if int(step_no) == lev:
                 sentences_by_level.append(sentences[idx])
         if not sentences_by_level:
-            print(f"No words found for level {step_no}")
+            print(f"No sentences found for level {step_no}")
         return sentences_by_level
 
 # seed word를 해당 난이도의 단어 중 랜덤하게 선택
