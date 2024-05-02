@@ -11,13 +11,23 @@ from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.layers import RepeatVector
 from tensorflow.keras.callbacks import EarlyStopping
+from transformers import TFGPT2LMHeadModel, GPT2Tokenizer
 
 
 class WordGenerator:
     def __init__(self):
-        self.tokenizer, self.level_tokenizer, self.model, self.max_sequence_len, self.level, self.words = self.load_data_and_model()
+        (
+            self.tokenizer,
+            self.level_tokenizer,
+            self.model,
+            self.max_sequence_len,
+            self.level,
+            self.words,
+            self.gpt_tokenizer,
+            self.gpt_model,
+        ) = self.load_word_data_and_model()
 
-    def load_data_and_model(self):
+    def load_word_data_and_model(self):
         # 현재 디렉토리와 파일 경로 설정
         current_directory = os.getcwd()
         relative_path = os.path.join("dataset", "words.csv")
@@ -28,6 +38,10 @@ class WordGenerator:
         # 데이터 처리
         words = csv["QUESTION"]  # 단어 데이터
         level = csv["CURRICULUM_STEP_NO"]  # 난이도 데이터
+
+        model_name = "gpt2-medium"  # 사용할 GPT 모델의 이름 설정
+        gpt_tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+        gpt_model = TFGPT2LMHeadModel.from_pretrained(model_name)
 
         # 데이터 처리 (난이도 정보 포함)
         # 난이도 토크나이징 및 시퀀스화
@@ -127,7 +141,16 @@ class WordGenerator:
             # 저장된 모델 불러오기
             model = tf.keras.models.load_model("word_generation_model.keras")
 
-        return tokenizer, level_tokenizer, model, max_sequence_len, level, words
+        return (
+            tokenizer,
+            level_tokenizer,
+            model,
+            max_sequence_len,
+            level,
+            words,
+            gpt_tokenizer,
+            gpt_model,
+        )
 
     # 난이도에 해당하는 단어 목록 가져오기
     def get_words_by_level(self, step_no):
@@ -151,14 +174,18 @@ class WordGenerator:
         level_seq = self.level_tokenizer.texts_to_sequences([level_str])
 
         if not level_seq or not level_seq[0]:
-            raise ValueError(f"난이도 '{step_no}'에 해당하는 시퀀스를 찾을 수 없습니다.")
+            raise ValueError(
+                f"난이도 '{step_no}'에 해당하는 시퀀스를 찾을 수 없습니다."
+            )
 
         level_seq = np.array(level_seq).reshape(-1, 1)  # 입력 형태에 맞게 reshape
-        
+
         output_words = []  # 생성된 단어들을 저장할 리스트
         while len(output_words) < n_words:
             token_list = self.tokenizer.texts_to_sequences([seed_word])[0]
-            token_list = pad_sequences([token_list], maxlen=self.max_sequence_len - 1, padding="pre")
+            token_list = pad_sequences(
+                [token_list], maxlen=self.max_sequence_len - 1, padding="pre"
+            )
 
             predicted = self.model.predict([token_list, level_seq], verbose=0)
             predicted_index = np.random.choice(range(len(predicted[0])), p=predicted[0])
@@ -166,9 +193,51 @@ class WordGenerator:
 
             # 정규 표현식을 사용해 영어 단어인지 확인합니다.
             if re.match("^[a-zA-Z]+$", output_word) and output_word not in output_words:
-                output_words.append(output_word)  # 중복되지 않고 영어인 단어만 리스트에 추가
+                output_words.append(
+                    output_word
+                )  # 중복되지 않고 영어인 단어만 리스트에 추가
             else:
                 # 영어 단어가 아니거나 중복된 단어가 생성되었을 경우, 다음 단어 생성을 시도합니다.
                 continue
-        print(output_words)
         return output_words  # 생성된 단어들을 리스트로 반환
+
+    # 단어 생성 함수 수정
+    def generate_word_with_gpt(self, step_no, n_words):
+        generated_words = set()  # 중복된 단어를 필터링하기 위한 집합
+        generated_count = 0
+
+        while generated_count < n_words:
+            # seed word와 난이도를 토큰화
+            seed_word = self.select_seed_word_by_level(step_no)
+            input_text = (
+                seed_word + " " + str(step_no)
+            )  # seed word와 난이도 정보를 합침
+            input_ids = self.gpt_tokenizer.encode(input_text, return_tensors="tf")
+
+            # GPT 모델을 사용하여 단어 생성
+            output = self.gpt_model.generate(
+                input_ids,
+                max_length=len(seed_word)
+                + n_words * 2,  # seed word 길이와 생성할 단어의 최대 길이 설정
+                pad_token_id=self.gpt_tokenizer.eos_token_id,  # 문장 종료 토큰 사용
+                num_return_sequences=1,  # 생성할 시퀀스의 수
+                eos_token_id=self.gpt_tokenizer.eos_token_id,  # 종료 토큰 설정
+                early_stopping=False,  # early_stopping을 해제하여 경고를 제거
+                num_beams=1,  # 빔 서치를 사용하여 생성, num_beams를 1로 설정
+            )
+
+            # 생성된 단어 디코딩
+            decoded_output = self.gpt_tokenizer.decode(
+                output[0], skip_special_tokens=True
+            )
+
+            # 생성된 단어 중에서 영어 단어만 추출하고 한 글자 단어는 제외
+            generated_words.update(
+                word
+                for word in decoded_output.split()
+                if re.match("^[a-zA-Z]{2,}$", word.lower())
+            )
+            generated_count = len(generated_words)
+
+        # 필요한 수의 단어만 추출하여 반환
+        return list(generated_words)[:n_words]

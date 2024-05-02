@@ -70,7 +70,9 @@ y = to_categorical(labels, num_classes=total_words)
 X_level = np.array(level_sequences)  # 마지막 난이도 정보는 제외
 
 # 모델 구성
-sentence_input = Input(shape=(max_sequence_len - 1,), dtype="int32", name="sentence_input")
+sentence_input = Input(
+    shape=(max_sequence_len - 1,), dtype="int32", name="sentence_input"
+)
 level_input = Input(shape=(1,), dtype="int32", name="level_input")
 
 sentence_embedding = Embedding(input_dim=total_words, output_dim=64)(sentence_input)
@@ -92,14 +94,16 @@ model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accur
 batch_size = 8
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = False
-find_epochs = False
+train_model = True
+find_epochs = True
 
 if train_model:
 
-    if find_epochs: 
+    if find_epochs:
         # 검증 데이터 준비 예시
-        split_index = int(len(X) * 0.8)  # 전체 데이터의 80%를 학습에 사용하고 20%를 검증에 사용
+        split_index = int(
+            len(X) * 0.8
+        )  # 전체 데이터의 80%를 학습에 사용하고 20%를 검증에 사용
         X_val = X[split_index:]
         X_level_val = X_level[split_index:]
         y_val = y[split_index:]
@@ -126,7 +130,7 @@ if train_model:
     model.fit(
         [X, X_level],
         y,
-        epochs=optimal_epoch, # optimal_epoch
+        epochs=optimal_epoch,  # optimal_epoch
         batch_size=batch_size,  # 미니배치 크기 설정
         verbose=1,
     )
@@ -152,7 +156,7 @@ def generate_sentence(step_no, n_sentences):
     if len(available_indices) == 0:
         print(f"난이도 '{step_no}'에 해당하는 문장이 없습니다. 대체 문장을 생성합니다.")
         return ["No sentence available for this difficulty level."] * n_sentences
-    
+
     while len(output_sentences) < n_sentences:
         seed_sentence_index = random.choice(available_indices)
         seed_sentence = sentences[seed_sentence_index]
@@ -160,7 +164,9 @@ def generate_sentence(step_no, n_sentences):
         output_sentence = seed_sentence
         while len(output_sentence.split()) < max_sequence_len - 1:
             token_list = tokenizer.texts_to_sequences([output_sentence])[0]
-            token_list = pad_sequences([token_list], maxlen=max_sequence_len - 1, padding="pre")
+            token_list = pad_sequences(
+                [token_list], maxlen=max_sequence_len - 1, padding="pre"
+            )
 
             predicted = model.predict([token_list, level_seq], verbose=0)
             predicted_index = np.random.choice(range(len(predicted[0])), p=predicted[0])
@@ -169,33 +175,37 @@ def generate_sentence(step_no, n_sentences):
                 output_sentence += " " + output_word
             else:
                 break
-        
+
         output_sentences.append(output_sentence)
 
     return output_sentences
+
 
 model_name = "gpt2-medium"  # 사용할 GPT 모델의 이름 설정
 gpt_tokenizer = GPT2Tokenizer.from_pretrained(model_name)
 gpt_model = TFGPT2LMHeadModel.from_pretrained(model_name)
 
+
 # 난이도에 해당하는 단어 목록 가져오기
 def get_sentence_by_level(step_no):
-        sentences_by_level = []
-        for idx, lev in enumerate(level):
-            if int(step_no) == lev:
-                sentences_by_level.append(sentences[idx])
-        if not sentences_by_level:
-            print(f"No sentences found for level {step_no}")
-        return sentences_by_level
+    sentences_by_level = []
+    for idx, lev in enumerate(level):
+        if int(step_no) == lev:
+            sentences_by_level.append(sentences[idx])
+    if not sentences_by_level:
+        print(f"No sentences found for level {step_no}")
+    return sentences_by_level
+
 
 # seed word를 해당 난이도의 단어 중 랜덤하게 선택
 def select_seed_sentence_by_level(step_no):
-        sentences_by_level = get_sentence_by_level(step_no)
-        return random.choice(sentences_by_level)
-    
+    sentences_by_level = get_sentence_by_level(step_no)
+    return random.choice(sentences_by_level)
+
+
 def generate_sentences_with_gpt(step_no, n_sentences, gpt_model, gpt_tokenizer):
     generated_sentences = []  # 생성된 문장들을 저장할 리스트
-    
+
     while len(generated_sentences) < n_sentences:
         # seed word와 난이도를 토큰화
         seed_word = select_seed_sentence_by_level(step_no)
@@ -217,13 +227,13 @@ def generate_sentences_with_gpt(step_no, n_sentences, gpt_model, gpt_tokenizer):
         decoded_output = gpt_tokenizer.decode(output[0], skip_special_tokens=True)
 
         # 문장에서 영어 문장만 추출
-        english_sentences = re.findall(r'\b[a-zA-Z\s]+\b', decoded_output)
+        english_sentences = re.findall(r"\b[a-zA-Z\s]+\b", decoded_output)
 
         # 추출된 영어 문장 중에서 중복 제거하고 생성된 문장들에 추가
         for sentence in english_sentences:
             if sentence not in generated_sentences:
                 generated_sentences.append(sentence)
-                
+
         # 생성된 문장이 n_sentences에 도달하면 종료
         if len(generated_sentences) >= n_sentences:
             break
@@ -231,11 +241,12 @@ def generate_sentences_with_gpt(step_no, n_sentences, gpt_model, gpt_tokenizer):
     # 필요한 수의 문장만 추출하여 반환
     return generated_sentences[:n_sentences]
 
+
 # 문장 생성 테스트
 generated_sentences = generate_sentence(25, 1)
 for sentence in generated_sentences:
-    print('base:',sentence)
-    
+    print("base:", sentence)
+
 generated_sentences = generate_sentences_with_gpt(25, 1, gpt_model, gpt_tokenizer)
 for sentence in generated_sentences:
-    print('gpt2:',sentence)
+    print("gpt2:", sentence)
