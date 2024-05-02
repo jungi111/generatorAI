@@ -78,7 +78,7 @@ class WordGenerator:
 
     def train_model(self):
         # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-        train_model = False
+        train_model = True
 
         if train_model:
             split_index = int(len(self.X) * 0.8)
@@ -91,7 +91,7 @@ class WordGenerator:
             history = self.model.fit(
                 [self.X, self.X_level],
                 self.y,
-                epochs=300,
+                epochs=5,
                 validation_data=([X_val, X_level_val], y_val),
                 callbacks=[early_stopping],
                 verbose=1,
@@ -99,7 +99,7 @@ class WordGenerator:
 
             optimal_epoch = np.argmin(history.history["val_loss"]) + 1
             self.model.fit([self.X, self.X_level], self.y, epochs=optimal_epoch, verbose=1)
-            tf.keras.models.save(self.model, "word_generation_model.keras")
+            tf.keras.models.save_model(self.model, "word_generation_model.keras")
         else:
             # 저장된 모델 불러오기
             self.model = tf.keras.models.load_model("word_generation_model.keras")

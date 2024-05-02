@@ -100,7 +100,7 @@ if train_model:
     history = model.fit(
         [X, X_level],
         y,
-        epochs=300,
+        epochs=5,
         validation_data=([X_val, X_level_val], y_val),
         callbacks=[early_stopping],
         verbose=1,
@@ -111,7 +111,7 @@ if train_model:
     # 모델 학습
     model.fit([X, X_level], y, epochs=optimal_epoch, verbose=1)
     # 학습된 모델 저장
-    tf.keras.models.save(model, "word_generation_model.keras")
+    tf.keras.models.save_model(model, "word_generation_model.keras")
 else:
     # 저장된 모델 불러오기
     model = tf.keras.models.load_model("word_generation_model.keras")

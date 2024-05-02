@@ -162,7 +162,7 @@ class SentenceGenerator:
                 verbose=1,
             )
             # 학습된 모델 저장
-            tf.keras.models.save(self.model, "sentence_generation_model.keras")
+            tf.keras.models.save_model(self.model, "sentence_generation_model.keras")
         else:
             # 저장된 모델 불러오기
             self.model = tf.keras.models.load_model("sentence_generation_model.keras")

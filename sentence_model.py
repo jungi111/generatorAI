@@ -94,8 +94,8 @@ model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accur
 batch_size = 8
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = True
-find_epochs = True
+train_model = False
+find_epochs = False
 
 if train_model:
 
@@ -135,7 +135,7 @@ if train_model:
         verbose=1,
     )
     # 학습된 모델 저장
-    tf.keras.models.save(model, "sentence_generation_model.keras")
+    tf.keras.models.save_model(model, "sentence_generation_model.keras")
 else:
     # 저장된 모델 불러오기
     model = tf.keras.models.load_model("sentence_generation_model.keras")
