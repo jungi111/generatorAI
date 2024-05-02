@@ -79,7 +79,7 @@ model = Model(inputs=[word_input, level_input], outputs=output_layer)
 model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = True
+train_model = False
 
 if train_model:
 
@@ -114,7 +114,7 @@ if train_model:
     model.save("word_generation_model.keras")
 else:
     # 저장된 모델 불러오기
-    model = tf.keras.models.load_model("word_generation_model.keras")
+    model.load_weights("word_generation_model.keras")
 
 
 # 난이도에 해당하는 단어 목록 가져오기

@@ -138,7 +138,7 @@ if train_model:
     model.save("sentence_generation_model.keras")
 else:
     # 저장된 모델 불러오기
-    model = tf.keras.models.load_model("sentence_generation_model.keras")
+    model.load_weights("sentence_generation_model.keras")
 
 
 # 문장 생성 함수

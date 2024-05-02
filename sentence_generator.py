@@ -165,7 +165,7 @@ class SentenceGenerator:
             model.save("sentence_generation_model.keras")
         else:
             # 저장된 모델 불러오기
-            model = tf.keras.models.load_model("sentence_generation_model.keras")
+            self.model.load_weights("sentence_generation_model.keras")
 
         return (
             tokenizer,
