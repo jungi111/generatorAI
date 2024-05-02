@@ -11,6 +11,7 @@ from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.utils import to_categorical
 from tensorflow.keras.layers import RepeatVector
 from tensorflow.keras.callbacks import EarlyStopping
+from transformers import TFGPT2LMHeadModel, GPT2Tokenizer
 
 # 데이터 불러오기
 current_directory = os.getcwd()
@@ -91,8 +92,8 @@ model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accur
 batch_size = 8
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = True
-find_epochs = True
+train_model = False
+find_epochs = False
 
 if train_model:
 
@@ -173,7 +174,68 @@ def generate_sentence(step_no, n_sentences):
 
     return output_sentences
 
+model_name = "gpt2-medium"  # 사용할 GPT 모델의 이름 설정
+gpt_tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+gpt_model = TFGPT2LMHeadModel.from_pretrained(model_name)
+
+# 난이도에 해당하는 단어 목록 가져오기
+def get_sentence_by_level(step_no):
+        sentences_by_level = []
+        for idx, lev in enumerate(level):
+            if int(step_no) == lev:
+                sentences_by_level.append(sentences[idx])
+        if not sentences_by_level:
+            print(f"No words found for level {step_no}")
+        return sentences_by_level
+
+# seed word를 해당 난이도의 단어 중 랜덤하게 선택
+def select_seed_sentence_by_level(step_no):
+        sentences_by_level = get_sentence_by_level(step_no)
+        return random.choice(sentences_by_level)
+    
+def generate_sentences_with_gpt(step_no, n_sentences, gpt_model, gpt_tokenizer):
+    generated_sentences = []  # 생성된 문장들을 저장할 리스트
+    
+    while len(generated_sentences) < n_sentences:
+        # seed word와 난이도를 토큰화
+        seed_word = select_seed_sentence_by_level(step_no)
+        input_text = seed_word + " " + str(step_no)  # seed word와 난이도 정보를 합침
+        input_ids = gpt_tokenizer.encode(input_text, return_tensors="tf")
+
+        # GPT 모델을 사용하여 문장 생성
+        output = gpt_model.generate(
+            input_ids,
+            max_length=50,  # 최대 길이 설정 (원하는 문장의 최대 길이에 맞게 조정)
+            pad_token_id=gpt_tokenizer.eos_token_id,  # 문장 종료 토큰 사용
+            num_return_sequences=1,  # 생성할 시퀀스의 수
+            eos_token_id=gpt_tokenizer.eos_token_id,  # 종료 토큰 설정
+            early_stopping=False,  # early_stopping을 해제하여 경고를 제거
+            num_beams=1,  # 빔 서치를 사용하여 생성, num_beams를 1로 설정
+        )
+
+        # 생성된 문장 디코딩
+        decoded_output = gpt_tokenizer.decode(output[0], skip_special_tokens=True)
+
+        # 문장에서 영어 문장만 추출
+        english_sentences = re.findall(r'\b[a-zA-Z\s]+\b', decoded_output)
+
+        # 추출된 영어 문장 중에서 중복 제거하고 생성된 문장들에 추가
+        for sentence in english_sentences:
+            if sentence not in generated_sentences:
+                generated_sentences.append(sentence)
+                
+        # 생성된 문장이 n_sentences에 도달하면 종료
+        if len(generated_sentences) >= n_sentences:
+            break
+
+    # 필요한 수의 문장만 추출하여 반환
+    return generated_sentences[:n_sentences]
+
 # 문장 생성 테스트
 generated_sentences = generate_sentence(25, 1)
 for sentence in generated_sentences:
-    print(sentence)
+    print('base:',sentence)
+    
+generated_sentences = generate_sentences_with_gpt(25, 1, gpt_model, gpt_tokenizer)
+for sentence in generated_sentences:
+    print('gpt2:',sentence)
