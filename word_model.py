@@ -100,7 +100,7 @@ if train_model:
     history = model.fit(
         [X, X_level],
         y,
-        epochs=5,
+        epochs=300,
         validation_data=([X_val, X_level_val], y_val),
         callbacks=[early_stopping],
         verbose=1,
