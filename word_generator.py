@@ -99,10 +99,10 @@ class WordGenerator:
 
             optimal_epoch = np.argmin(history.history["val_loss"]) + 1
             self.model.fit([self.X, self.X_level], self.y, epochs=optimal_epoch, verbose=1)
-            self.model.save("word_generation_model.keras")
+            tf.keras.models.save(self.model, "word_generation_model.keras")
         else:
             # 저장된 모델 불러오기
-            self.model.load_weights("word_generation_model.keras")
+            self.model = tf.keras.models.load_model("word_generation_model.keras")
 
 
     def generate_word(self, step_no, n_words):

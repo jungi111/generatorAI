@@ -135,10 +135,10 @@ if train_model:
         verbose=1,
     )
     # 학습된 모델 저장
-    model.save("sentence_generation_model.keras")
+    tf.keras.models.save(model, "sentence_generation_model.keras")
 else:
     # 저장된 모델 불러오기
-    model.load_weights("sentence_generation_model.keras")
+    model = tf.keras.models.load_model("sentence_generation_model.keras")
 
 
 # 문장 생성 함수
