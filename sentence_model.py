@@ -16,7 +16,7 @@ from transformers import TFGPT2LMHeadModel, GPT2Tokenizer
 # 데이터 불러오기
 current_directory = os.getcwd()
 relative_path = os.path.join("dataset", "sentences.csv")
-csv = pd.read_csv(os.path.join(current_directory, relative_path), nrows=60000)
+csv = pd.read_csv(os.path.join(current_directory, relative_path), nrows=10000)
 
 # 결측값 처리
 csv = csv.dropna()  # 결측값이 있는 행 삭제
@@ -38,7 +38,7 @@ for index, lvl in enumerate(level):
 # 문장 토크나이징 및 시퀀스화
 tokenizer = Tokenizer()
 tokenizer.fit_on_texts(sentences)
-total_words = len(tokenizer.word_index) + 1
+total_sentences = len(tokenizer.sentence_index) + 1
 
 # 난이도 토크나이징 및 시퀀스화
 level_tokenizer = Tokenizer()
@@ -64,7 +64,7 @@ input_sequences = np.array(
 # 특징과 레이블 분리
 X = input_sequences[:, :-1]
 labels = input_sequences[:, -1]
-y = to_categorical(labels, num_classes=total_words)
+y = to_categorical(labels, num_classes=total_sentences)
 
 # 난이도 정보를 특징에 포함
 X_level = np.array(level_sequences)  # 마지막 난이도 정보는 제외
@@ -75,7 +75,7 @@ sentence_input = Input(
 )
 level_input = Input(shape=(1,), dtype="int32", name="level_input")
 
-sentence_embedding = Embedding(input_dim=total_words, output_dim=64)(sentence_input)
+sentence_embedding = Embedding(input_dim=total_sentences, output_dim=64)(sentence_input)
 level_embedding = Embedding(input_dim=np.max(level_seq) + 1, output_dim=64)(level_input)
 level_embedding = Reshape((64,))(level_embedding)
 
@@ -84,18 +84,18 @@ level_embedding_repeated = RepeatVector(max_sequence_len - 1)(level_embedding)
 
 # 레이어 연결 수정
 concat_layer = Concatenate(axis=-1)([sentence_embedding, level_embedding_repeated])
-lstm_layer = LSTM(16)(concat_layer)
-output_layer = Dense(total_words, activation="softmax")(lstm_layer)
+lstm_layer = LSTM(30)(concat_layer)
+output_layer = Dense(total_sentences, activation="softmax")(lstm_layer)
 
 model = Model(inputs=[sentence_input, level_input], outputs=output_layer)
 model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
 
 # 미니배치 크기 설정
-batch_size = 8
+batch_size = 32
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = False
-find_epochs = False
+train_model = True
+find_epochs = True
 
 if train_model:
 
@@ -158,9 +158,7 @@ def generate_sentence(step_no, n_sentences):
         return ["No sentence available for this difficulty level."] * n_sentences
 
     while len(output_sentences) < n_sentences:
-        seed_sentence_index = random.choice(available_indices)
-        seed_sentence = sentences[seed_sentence_index]
-
+        seed_sentence = select_seed_sentence_by_level(step_no)
         output_sentence = seed_sentence
         while len(output_sentence.split()) < max_sequence_len - 1:
             token_list = tokenizer.texts_to_sequences([output_sentence])[0]
@@ -176,6 +174,7 @@ def generate_sentence(step_no, n_sentences):
             else:
                 break
 
+        # generated_sentence = ' '.join(output_sentence.split()[len(seed_sentence.split()):])
         output_sentences.append(output_sentence)
 
     return output_sentences
@@ -208,8 +207,8 @@ def generate_sentences_with_gpt(step_no, n_sentences, gpt_model, gpt_tokenizer):
 
     while len(generated_sentences) < n_sentences:
         # seed word와 난이도를 토큰화
-        seed_word = select_seed_sentence_by_level(step_no)
-        input_text = seed_word + " " + str(step_no)  # seed word와 난이도 정보를 합침
+        seed_sentence = select_seed_sentence_by_level(step_no)
+        input_text = seed_sentence + " " + str(step_no)  # seed sentence와 난이도 정보를 합침
         input_ids = gpt_tokenizer.encode(input_text, return_tensors="tf")
 
         # GPT 모델을 사용하여 문장 생성
