@@ -38,7 +38,7 @@ for index, lvl in enumerate(level):
 # 문장 토크나이징 및 시퀀스화
 tokenizer = Tokenizer()
 tokenizer.fit_on_texts(sentences)
-total_sentences = len(tokenizer.sentence_index) + 1
+total_words = len(tokenizer.word_index) + 1
 
 # 난이도 토크나이징 및 시퀀스화
 level_tokenizer = Tokenizer()
@@ -48,12 +48,12 @@ level_seq = np.array(level_tokenizer.texts_to_sequences(level.astype(str)))
 # 시퀀스 생성
 input_sequences = []
 level_sequences = []
-for sentence_index, sentence in enumerate(sentences):
+for word_index, sentence in enumerate(sentences):
     token_list = tokenizer.texts_to_sequences([sentence])[0]
     for i in range(1, len(token_list)):
         n_gram_sequence = token_list[: i + 1]
         input_sequences.append(n_gram_sequence)
-        level_sequences.append(level_seq[sentence_index])
+        level_sequences.append(level_seq[word_index])
 
 # 패딩 추가
 max_sequence_len = max([len(x) for x in input_sequences])
@@ -64,7 +64,7 @@ input_sequences = np.array(
 # 특징과 레이블 분리
 X = input_sequences[:, :-1]
 labels = input_sequences[:, -1]
-y = to_categorical(labels, num_classes=total_sentences)
+y = to_categorical(labels, num_classes=total_words)
 
 # 난이도 정보를 특징에 포함
 X_level = np.array(level_sequences)  # 마지막 난이도 정보는 제외
@@ -75,7 +75,7 @@ sentence_input = Input(
 )
 level_input = Input(shape=(1,), dtype="int32", name="level_input")
 
-sentence_embedding = Embedding(input_dim=total_sentences, output_dim=64)(sentence_input)
+sentence_embedding = Embedding(input_dim=total_words, output_dim=64)(sentence_input)
 level_embedding = Embedding(input_dim=np.max(level_seq) + 1, output_dim=64)(level_input)
 level_embedding = Reshape((64,))(level_embedding)
 
@@ -85,7 +85,7 @@ level_embedding_repeated = RepeatVector(max_sequence_len - 1)(level_embedding)
 # 레이어 연결 수정
 concat_layer = Concatenate(axis=-1)([sentence_embedding, level_embedding_repeated])
 lstm_layer = LSTM(30)(concat_layer)
-output_layer = Dense(total_sentences, activation="softmax")(lstm_layer)
+output_layer = Dense(total_words, activation="softmax")(lstm_layer)
 
 model = Model(inputs=[sentence_input, level_input], outputs=output_layer)
 model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
@@ -94,8 +94,8 @@ model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accur
 batch_size = 32
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = True
-find_epochs = True
+train_model = False
+find_epochs = False
 
 if train_model:
 
