@@ -94,8 +94,8 @@ model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accur
 batch_size = 32
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = False
-find_epochs = False
+train_model = True
+find_epochs = True
 
 if train_model:
 

@@ -31,6 +31,13 @@ relative_path = os.path.join("dataset", "words.csv")
 # 데이터 불러오기
 csv = pd.read_csv(os.path.join(current_directory, relative_path))
 
+# 데이터 처리 및 중복 제거
+csv.drop_duplicates(subset=["QUESTION", "CURRICULUM_STEP_NO"], inplace=True)
+
+# 모든 단어를 소문자로 변환하고, 구두점을 제거하여 정규화
+csv["QUESTION"] = csv["QUESTION"].str.lower()
+csv["QUESTION"] = csv["QUESTION"].apply(lambda x: re.sub(r"[^a-z]", "", x))
+
 # 데이터 처리
 words = csv["QUESTION"]
 levels = csv["CURRICULUM_STEP_NO"]
@@ -131,11 +138,11 @@ def build_model():
     word_input = Input(shape=(max_sequence_len - 1,), dtype="int32", name="word_input")
     level_input = Input(shape=(1,), dtype="int32", name="level_input")
 
-    word_embedding = Embedding(input_dim=total_words, output_dim=128)(word_input)
-    level_embedding = Embedding(input_dim=np.max(X_level_train) + 1, output_dim=128)(
+    word_embedding = Embedding(input_dim=total_words, output_dim=64)(word_input)
+    level_embedding = Embedding(input_dim=np.max(X_level_train) + 1, output_dim=32)(
         level_input
     )
-    level_embedding = Reshape((128,))(level_embedding)
+    level_embedding = Reshape((32,))(level_embedding)
     level_embedding_repeated = RepeatVector(max_sequence_len - 1)(level_embedding)
 
     # 레이어 연결
@@ -143,21 +150,29 @@ def build_model():
 
     # 다중 Transformer 블록 적용
     transformer_output = concat_layer
-    for _ in range(2):  # 블록 수를 2개로 줄임
+    for _ in range(1):  # 블록 수를 2개로 줄임
         transformer_output = transformer_block(
-            transformer_output, head_size=64, num_heads=4, ff_dim=128, dropout=0.1
+            transformer_output, head_size=32, num_heads=2, ff_dim=64, dropout=0.3
         )
 
     # 최종 출력 레이어
     transformer_output = GlobalAveragePooling1D()(transformer_output)
     flattened = Flatten()(transformer_output)
     flattened = BatchNormalization()(flattened)
-    flattened = Dropout(0.2)(flattened)
+    flattened = Dropout(0.3)(flattened)
+    
+    # 첫 번째 Dense 레이어
+    dense1 = Dense(128, activation="relu")(flattened)
+    dense1 = Dropout(0.4)(dense1)
 
-    output_layer = Dense(total_words, activation="softmax")(flattened)
+    # 두 번째 Dense 레이어
+    dense2 = Dense(64, activation="relu")(dense1)
+    dense2 = Dropout(0.4)(dense2)
+
+    output_layer = Dense(total_words, activation="softmax")(dense2)
 
     model = Model(inputs=[word_input, level_input], outputs=output_layer)
-    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0005)  # 학습률 조정
+    optimizer = tf.keras.optimizers.Adam(learning_rate=0.0005, clipnorm=1.0)  # 학습률 조정 및 Gradient Clippin
     model.compile(
         loss="sparse_categorical_crossentropy", optimizer=optimizer, metrics=["accuracy"]
     )
@@ -165,7 +180,7 @@ def build_model():
 
 # 콜백 정의
 early_stopping = EarlyStopping(
-    monitor="val_loss", patience=5, restore_best_weights=True
+    monitor="val_loss", patience=8, restore_best_weights=True
 )
 model_checkpoint = ModelCheckpoint(
     "word_generation_model.keras",
@@ -174,11 +189,12 @@ model_checkpoint = ModelCheckpoint(
     save_weights_only=False,
 )
 reduce_lr = ReduceLROnPlateau(
-    monitor="val_loss", factor=0.3, patience=2, min_lr=1e-6, verbose=1
+    monitor="val_loss", factor=0.5, patience=4, min_lr=1e-6, verbose=1
 )
 
+
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = False
+train_model = True
 
 if train_model:
     model = build_model()
@@ -187,22 +203,30 @@ if train_model:
     history = model.fit(
         [X_train, X_level_train],
         y_train,
-        epochs=50,
+        epochs=30,
         validation_data=([X_val, X_level_val], y_val),
         callbacks=[early_stopping, model_checkpoint, reduce_lr],
+        batch_size= 64,
         verbose=1,
     )
 
     # 최적의 에포크 찾기
-    optimal_epoch = np.argmin(history.history["val_loss"]) + 1
-    # 모델 학습
-    model.fit([X_train, X_level_train], y_train, epochs=optimal_epoch, verbose=1)
+    # optimal_epoch = np.argmin(history.history["val_loss"]) + 1
+
+    # # 최적의 에포크로 다시 학습
+    # model.fit(
+    #     [X_train, X_level_train],
+    #     y_train,
+    #     epochs=optimal_epoch,
+    #     verbose=1
+    # )
+
     # 학습된 모델 저장
-    tf.keras.models.save_model(model, "transformer_word_model.keras")
+    tf.keras.models.save_model(model, "transformer_word_model_new.keras")
 
 else:
     # 저장된 모델 불러오기
-    model = tf.keras.models.load_model("transformer_word_model.keras")
+    model = tf.keras.models.load_model("transformer_word_model_new.keras")
 
 
 # 단어 생성 함수
