@@ -38,6 +38,8 @@ csv.drop_duplicates(subset=["QUESTION", "CURRICULUM_STEP_NO"], inplace=True)
 csv["QUESTION"] = csv["QUESTION"].str.lower()
 csv["QUESTION"] = csv["QUESTION"].apply(lambda x: re.sub(r"[^a-z]", "", x))
 
+print(len(csv))
+
 # 데이터 처리
 words = csv["QUESTION"]
 levels = csv["CURRICULUM_STEP_NO"]
@@ -194,7 +196,7 @@ reduce_lr = ReduceLROnPlateau(
 
 
 # 학습 여부에 따라 모델을 학습하거나 불러와서 사용
-train_model = True
+train_model = False
 
 if train_model:
     model = build_model()
