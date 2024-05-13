@@ -45,15 +45,15 @@ def train_epoch(model, classifier, loader, optimizer, criterion, device, epoch, 
     return running_loss / len(loader), 100. * correct / total
 
 # 검증 함수
-def validate_epoch(model, classifier, loader, criterion, device, epoch, num_epochs):
+def validate_epoch(model, classifier, loader, criterion, device, min_val_loss, patience, patience_counter):
     model.eval()
     classifier.eval()
     running_loss = 0.0
     correct = 0
     total = 0
 
-    with torch.no_grad():  # 그라디언트 계산 비활성화
-        loop = tqdm(loader, leave=False)  # 진행 바 설정
+    with torch.no_grad():
+        loop = tqdm(loader, leave=False)
         for batch in loop:
             input_ids, attention_mask, labels = batch['input_ids'].to(device), batch['attention_mask'].to(device), batch['labels'].to(device)
             outputs = model(input_ids, attention_mask=attention_mask).last_hidden_state[:, 0, :]
@@ -65,10 +65,23 @@ def validate_epoch(model, classifier, loader, criterion, device, epoch, num_epoc
             total += labels.size(0)
             correct += (predicted == labels).sum().item()
 
-            loop.set_description(f"Validation Epoch [{epoch+1}/{num_epochs}]")
-            loop.set_postfix(val_loss=running_loss/total, val_accuracy=100. * correct/total)
+            current_val_loss = running_loss / total
+            loop.set_description(f"Validation Epoch")
+            loop.set_postfix(val_loss=current_val_loss, val_accuracy=100. * correct/total)
 
-    return running_loss / len(loader), 100. * correct / total
+        # Early Stopping 로직
+        if current_val_loss < min_val_loss:
+            min_val_loss = current_val_loss
+            torch.save(model.state_dict(), 'best_model.pth')  # 최적의 모델 저장
+            patience_counter = 0  # 리셋
+        else:
+            patience_counter += 1
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                return None  # Early Stopping 조건 충족
+
+    return running_loss / len(loader), 100. * correct / total, min_val_loss, patience_counter
+
 
 
 # 문제 생성 함수
@@ -113,7 +126,7 @@ def remove_substring_duplicates(options, meaning):
             filtered_options.append(opt)
     return filtered_options
 
-def main(isTrain=False):
+def main(isTrain=True):
     
     device = torch.device('mps:0' if torch.backends.mps.is_available() else 'cpu')
 
@@ -166,31 +179,39 @@ def main(isTrain=False):
     model = GPT2Model.from_pretrained('gpt2', config=config).to(device)
     classifier = nn.Linear(config.n_embd, 4).to(device)  # 4개 선택지
     
+    num_epochs = 10  # 학습할 총 에포크 수
+        
+    # 옵티마이저 및 손실 함수 설정
+    optimizer = optim.AdamW(model.parameters(), lr=5e-5)
+    num_epochs = 3
+    num_training_steps = num_epochs * len(train_loader)
+    scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
+    criterion = nn.CrossEntropyLoss()
+    
+    # Early Stopping 관련 변수
+    min_val_loss = np.inf
+    patience_counter = 0
+    patience = 7
+    
     if isTrain:
-        num_epochs = 3  # 학습할 총 에포크 수
-        
-        # 옵티마이저 및 손실 함수 설정
-        optimizer = optim.AdamW(model.parameters(), lr=5e-5)
-        num_training_steps = num_epochs * len(train_loader)
-        scheduler = get_linear_schedule_with_warmup(optimizer, num_warmup_steps=0, num_training_steps=num_training_steps)
-        criterion = nn.CrossEntropyLoss()
-        
         for epoch in range(num_epochs):
-            print(f"Epoch {epoch+1} starting...")
             train_loss, train_accuracy = train_epoch(model, classifier, train_loader, optimizer, criterion, device, epoch, num_epochs, scheduler)
-            val_loss, val_accuracy = validate_epoch(model, classifier, val_loader, criterion, device, epoch, num_epochs)
+            val_result = validate_epoch(model, classifier, val_loader, criterion, device, min_val_loss, patience, patience_counter)
+            if val_result is None:  # Early Stopping 체크
+                break
+            else:
+                val_loss, val_accuracy, min_val_loss, patience_counter = val_result
             print(f'Epoch {epoch+1}, Train Loss: {train_loss}, Train Accuracy: {train_accuracy}, Val Loss: {val_loss}, Val Accuracy: {val_accuracy}')
             
-        torch.save(model.state_dict(), 'model_weights.pth')
-        torch.save(classifier.state_dict(), 'classifier_weights.pth')
+            if patience_counter >= patience:
+                print("Early stopping triggered.")
+                break
     else:
-        # 모델 로드
         model.load_state_dict(torch.load('model_weights.pth'))
         classifier.load_state_dict(torch.load('classifier_weights.pth'))
         model.eval()
         classifier.eval()
-        
-    # 예시 문제 생성
+
     difficulty_level = 33
     generated_question = generate_question(train_data, difficulty_level)
     print(generated_question)
