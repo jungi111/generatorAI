@@ -2,7 +2,6 @@ import os
 import pandas as pd
 import numpy as np
 import tensorflow as tf
-import re
 from sklearn.model_selection import train_test_split
 from tensorflow.keras.preprocessing.text import Tokenizer
 from tensorflow.keras.preprocessing.sequence import pad_sequences
@@ -23,6 +22,7 @@ from tensorflow.keras.layers import (
 )
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
+
 
 # 데이터 불러오기
 current_directory = os.getcwd()
