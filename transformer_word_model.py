@@ -24,6 +24,7 @@ from tensorflow.keras.layers import (
 from tensorflow.keras.models import Model
 from tensorflow.keras.callbacks import EarlyStopping, ModelCheckpoint, ReduceLROnPlateau
 
+
 # 데이터 준비
 current_directory = os.getcwd()
 relative_path = os.path.join("dataset", "words.csv")
