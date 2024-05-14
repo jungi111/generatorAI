@@ -13,10 +13,10 @@ from tqdm import tqdm
 
 def preprocess_data(data):
     print("Preprocessing data...")
-    data['QUESTION'] = data['QUESTION'].str.replace('[^\\w\\s]', '', regex=True).str.lower()
-    data['MEANING'] = data['MEANING'].str.replace('[^\\w\\s]', '', regex=True).str.lower()
+    data['QUESTION'] = data['QUESTION'].astype(str).str.replace(r'[^\w\s]', '', regex=True).str.lower()
+    data['ANSWER'] = data['ANSWER'].astype(str).str.replace(r'[^\w\s]', '', regex=True).str.lower()
     for i in range(1, 5):
-        data[f'DISTRACTOR_{i}'] = data[f'DISTRACTOR_{i}'].str.replace('[^\\w\\s]', '', regex=True).str.lower()
+        data[f'DISTRACTOR_{i}'] = data[f'DISTRACTOR_{i}'].astype(str).str.replace(r'[^\w\s]', '', regex=True).str.lower()
     return data
 
 def create_model(dropout_rate=0.3):
@@ -29,8 +29,7 @@ def create_model(dropout_rate=0.3):
         nn.ReLU(),
         nn.Linear(128, 64),
         nn.ReLU(),
-        nn.Linear(64, 4),
-        nn.Softmax(dim=1)
+        nn.Linear(64, 4),  # 네 가지 선택지를 포함하는 분류 문제
     )
     return base_model, classifier
 
@@ -42,24 +41,45 @@ def forward_pass(base_model, classifier, input_ids, attention_mask):
 
 def load_dataset(data, tokenizer, max_length):
     print("Loading dataset...")
-    questions = data['QUESTION'] + " " + data['MEANING']
-    labels = data['ANSWER'] - 1  # 라벨 인코딩
+    inputs = data['CURRICULUM_STEP_NO'].astype(str)
+    answers = data['ANSWER']
+    distractors = [data[f'DISTRACTOR_{i}'] for i in range(1, 5)]
 
     input_ids = []
     attention_masks = []
     label_list = []
 
-    for i in range(len(questions)):
+    for i in range(len(inputs)):
+        input_text = inputs.iloc[i]
         encodings = tokenizer(
-            questions.iloc[i],
+            input_text,
             padding='max_length',
             truncation=True,
             max_length=max_length,
             return_tensors='pt'
         )
-        input_ids.append(encodings['input_ids'].flatten())
-        attention_masks.append(encodings['attention_mask'].flatten())
-        label_list.append(torch.tensor(labels.iloc[i], dtype=torch.long))
+
+        # 모든 distractor가 존재하는지 확인
+        if pd.notna(answers.iloc[i]) and all(pd.notna(distractor.iloc[i]) for distractor in distractors):
+            options = [answers.iloc[i]] + [distractor.iloc[i] for distractor in distractors]
+            if len(options) != 5:
+                continue  # 선택지 수가 맞지 않으면 건너뛰기
+            
+            random.shuffle(options)
+
+            try:
+                answer_index = options.index(answers.iloc[i])
+                if answer_index >= 4:
+                    continue
+                input_ids.append(encodings['input_ids'].flatten())
+                attention_masks.append(encodings['attention_mask'].flatten())
+                label_list.append(torch.tensor(answer_index, dtype=torch.long))
+            except ValueError as e:
+                continue
+
+    # 유효한 데이터가 있는지 확인
+    if not (len(input_ids) == len(attention_masks) == len(label_list)):
+        raise ValueError("Mismatch in dataset lengths. Please check your dataset.")
 
     input_ids = torch.stack(input_ids)
     attention_masks = torch.stack(attention_masks)
@@ -67,6 +87,8 @@ def load_dataset(data, tokenizer, max_length):
 
     dataset = TensorDataset(input_ids, attention_masks, labels)
     return dataset
+
+
 
 def generate_question(data, level):
     print("Generating question...")
@@ -76,7 +98,7 @@ def generate_question(data, level):
 
     selected_row = filtered_data.sample(1).iloc[0]
     question = selected_row['QUESTION']
-    meaning = selected_row['MEANING']
+    answer = selected_row['ANSWER']
     distractors = [
         selected_row['DISTRACTOR_1'],
         selected_row['DISTRACTOR_2'],
@@ -84,18 +106,12 @@ def generate_question(data, level):
         selected_row['DISTRACTOR_4']
     ]
 
-    options = list(set(distractors + [meaning]))
-    options = [opt for opt in options if opt != meaning]
-    clean_options = remove_substring_duplicates(options, meaning)
+    options = [answer] + distractors
+    options = options[:4]  # 선택지가 4개가 되도록 보장
+    random.shuffle(options)
+    answer_index = options.index(answer)
 
-    if len(clean_options) >= 3:
-        random.shuffle(clean_options)
-        clean_options = clean_options[:3]
-        clean_options.append(meaning)
-        random.shuffle(clean_options)
-        answer_index = clean_options.index(meaning) + 1
-        return {"question": question, "options": clean_options, "answer": answer_index}
-    return "No valid options available."
+    return {"question": question, "options": options, "answer": answer_index}
 
 def remove_substring_duplicates(options, meaning):
     filtered_options = [opt for opt in options if opt != meaning and meaning not in opt]
@@ -136,13 +152,13 @@ def train(base_model, classifier, dataloader, criterion, optimizer, device, epoc
             correct_predictions += torch.sum(preds == labels)
             total_samples += labels.size(0)
         
-            avg_loss = total_loss / (len(dataloader))
-            accuracy = correct_predictions.float() / total_samples  # 변경된 부분
+            avg_loss = total_loss / len(dataloader)
+            accuracy = correct_predictions.float() / total_samples
 
-            pbar.set_postfix({"Loss": avg_loss, "Accuracy": accuracy.item()})  # 변경된 부분
+            pbar.set_postfix({"Loss": avg_loss, "Accuracy": accuracy.item()})
 
     avg_loss = total_loss / len(dataloader)
-    accuracy = correct_predictions.float() / total_samples  # 변경된 부분
+    accuracy = correct_predictions.float() / total_samples
     return avg_loss, accuracy
 
 def validate(base_model, classifier, dataloader, criterion, device, epoch):
@@ -166,18 +182,22 @@ def validate(base_model, classifier, dataloader, criterion, device, epoch):
             correct_predictions += torch.sum(preds == labels)
             total_samples += labels.size(0)
 
-            avg_loss = total_loss / (len(dataloader))
-            accuracy = correct_predictions.float() / total_samples  # 변경된 부분
+            avg_loss = total_loss / len(dataloader)
+            accuracy = correct_predictions.float() / total_samples
 
-            pbar.set_postfix({"Loss": avg_loss, "Accuracy": accuracy.item()})  # 변경된 부분
+            pbar.set_postfix({"Loss": avg_loss, "Accuracy": accuracy.item()})
 
     avg_loss = total_loss / len(dataloader)
-    accuracy = correct_predictions.float() / total_samples  # 변경된 부분
+    accuracy = correct_predictions.float() / total_samples
     return avg_loss, accuracy
 
 def main(isTrain=True):
-    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
-    print(f"Using device: {device}")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using device: MPS (Apple Silicon GPU)")
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"Using device: {device}")
 
     current_directory = os.getcwd()
     relative_path = os.path.join("dataset", "words_question.csv")
@@ -209,12 +229,12 @@ def main(isTrain=True):
     print("Model created and moved to device")
 
     optimizer = AdamW(list(base_model.parameters()) + list(classifier.parameters()), lr=5e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=2, verbose=True)
+    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=2)
     criterion = nn.CrossEntropyLoss()
     print("Optimizer, scheduler, and criterion set up")
 
     if isTrain:
-        total_epoch = 30
+        total_epoch = 5
         early_stopping_patience = 3
         best_val_loss = float('inf')
         patience_counter = 0
