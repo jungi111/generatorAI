@@ -1,197 +1,304 @@
 import os
 import pandas as pd
-import numpy as np
 import torch
-from torch import nn
-from torch.utils.data import DataLoader, Dataset, TensorDataset
-from sklearn.model_selection import train_test_split
-from transformers import GPT2Model, GPT2Tokenizer, GPT2Config
-from torch.optim import AdamW
-from torch.optim.lr_scheduler import ReduceLROnPlateau
-import random
+import re
+from torch.utils.data import DataLoader, TensorDataset
+from transformers import (
+    GPT2Tokenizer,
+    GPT2ForSequenceClassification,
+    GPT2LMHeadModel,
+    get_scheduler,
+    AdamW,
+)
 from tqdm import tqdm
+import random
+
 
 def preprocess_data(data):
     print("Preprocessing data...")
-    data['QUESTION'] = data['QUESTION'].astype(str).str.replace(r'[^\w\s]', '', regex=True).str.lower()
-    data['ANSWER'] = data['ANSWER'].astype(str).str.replace(r'[^\w\s]', '', regex=True).str.lower()
+    data["QUESTION"] = (
+        data["QUESTION"].astype(str).str.replace(r"[^\w\s]", "", regex=True).str.lower()
+    )
+    data["ANSWER"] = (
+        data["ANSWER"].astype(str).str.replace(r"[^\w\s]", "", regex=True).str.lower()
+    )
     for i in range(1, 5):
-        data[f'DISTRACTOR_{i}'] = data[f'DISTRACTOR_{i}'].astype(str).str.replace(r'[^\w\s]', '', regex=True).str.lower()
+        data[f"DISTRACTOR_{i}"] = (
+            data[f"DISTRACTOR_{i}"]
+            .astype(str)
+            .str.replace(r"[^\w\s]", "", regex=True)
+            .str.lower()
+        )
     return data
 
-def create_model(dropout_rate=0.3):
-    print("Creating model...")
-    config = GPT2Config.from_pretrained('gpt2')
-    base_model = GPT2Model.from_pretrained('gpt2', config=config)
-    classifier = nn.Sequential(
-        nn.Dropout(dropout_rate),
-        nn.Linear(config.hidden_size, 128),
-        nn.ReLU(),
-        nn.Linear(128, 64),
-        nn.ReLU(),
-        nn.Linear(64, 4),  # 네 가지 선택지를 포함하는 분류 문제
-    )
-    return base_model, classifier
 
-def forward_pass(base_model, classifier, input_ids, attention_mask):
-    base_outputs = base_model(input_ids=input_ids, attention_mask=attention_mask)
-    hidden_state = base_outputs.last_hidden_state[:, -1, :]
-    logits = classifier(hidden_state)
-    return logits
-
-def load_dataset(data, tokenizer, max_length):
-    print("Loading dataset...")
-    inputs = data['CURRICULUM_STEP_NO'].astype(str)
-    answers = data['ANSWER']
-    distractors = [data[f'DISTRACTOR_{i}'] for i in range(1, 5)]
-
+def encode_data(df, tokenizer):
     input_ids = []
     attention_masks = []
-    label_list = []
+    labels = []
 
-    for i in range(len(inputs)):
-        input_text = inputs.iloc[i]
-        encodings = tokenizer(
-            input_text,
-            padding='max_length',
+    for _, row in tqdm(df.iterrows(), desc="Encoding data"):
+        text = f"{row['QUESTION']} [SEP] {row['MEANING']}, {row['DISTRACTOR_1']}, {row['DISTRACTOR_2']}, {row['DISTRACTOR_3']}, {row['DISTRACTOR_4']}"
+        encoded_dict = tokenizer(
+            text,
+            add_special_tokens=True,
+            max_length=512,
             truncation=True,
-            max_length=max_length,
-            return_tensors='pt'
+            padding="max_length",
+            return_tensors="pt",
         )
-
-        # 모든 distractor가 존재하는지 확인
-        if pd.notna(answers.iloc[i]) and all(pd.notna(distractor.iloc[i]) for distractor in distractors):
-            options = [answers.iloc[i]] + [distractor.iloc[i] for distractor in distractors]
-            if len(options) != 5:
-                continue  # 선택지 수가 맞지 않으면 건너뛰기
-            
-            random.shuffle(options)
-
-            try:
-                answer_index = options.index(answers.iloc[i])
-                if answer_index >= 4:
-                    continue
-                input_ids.append(encodings['input_ids'].flatten())
-                attention_masks.append(encodings['attention_mask'].flatten())
-                label_list.append(torch.tensor(answer_index, dtype=torch.long))
-            except ValueError as e:
-                continue
-
-    # 유효한 데이터가 있는지 확인
-    if not (len(input_ids) == len(attention_masks) == len(label_list)):
-        raise ValueError("Mismatch in dataset lengths. Please check your dataset.")
+        input_ids.append(encoded_dict["input_ids"].squeeze(0))
+        attention_masks.append(encoded_dict["attention_mask"].squeeze(0))
+        labels.append(int(row["ANSWER"]) - 1)
 
     input_ids = torch.stack(input_ids)
     attention_masks = torch.stack(attention_masks)
-    labels = torch.stack(label_list)
+    labels = torch.tensor(labels)
 
+    return input_ids, attention_masks, labels
+
+
+def create_data_loaders(input_ids, attention_masks, labels, batch_size=16):
     dataset = TensorDataset(input_ids, attention_masks, labels)
-    return dataset
+    train_size = int(0.8 * len(dataset))
+    val_size = len(dataset) - train_size
+
+    train_dataset, val_dataset = torch.utils.data.random_split(
+        dataset, [train_size, val_size]
+    )
+
+    train_dataloader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
+    val_dataloader = DataLoader(val_dataset, batch_size=batch_size)
+
+    return train_dataloader, val_dataloader
 
 
+def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs=3):
+    scheduler = get_scheduler(
+        name="linear",
+        optimizer=optimizer,
+        num_warmup_steps=0,
+        num_training_steps=num_epochs * len(train_dataloader),
+    )
+    for epoch in range(num_epochs):
+        print(f"Epoch {epoch+1}")
 
-def generate_question(data, level):
-    print("Generating question...")
-    filtered_data = data[data['CURRICULUM_STEP_NO'] == level]
+        model.train()
+        total_train_loss = 0
+        correct_train_predictions = 0
+        total_train_samples = 0
+
+        with tqdm(train_dataloader, desc=f"Epoch {epoch + 1} - Training") as pbar:
+            for batch in pbar:
+                batch_inputs, batch_masks, batch_labels = batch
+                batch_inputs, batch_masks, batch_labels = (
+                    batch_inputs.to("cuda"),
+                    batch_masks.to("cuda"),
+                    batch_labels.to("cuda"),
+                )
+
+                model.zero_grad()
+                outputs = model(
+                    input_ids=batch_inputs,
+                    attention_mask=batch_masks,
+                    labels=batch_labels,
+                )
+                loss = outputs.loss
+                loss.backward()
+                optimizer.step()
+                scheduler.step()
+
+                total_train_loss += loss.item()
+                _, preds = torch.max(outputs.logits, dim=1)
+                correct_train_predictions += torch.sum(preds == batch_labels)
+                total_train_samples += batch_labels.size(0)
+
+                avg_train_loss = total_train_loss / len(train_dataloader)
+                train_accuracy = correct_train_predictions.float() / total_train_samples
+
+                pbar.set_postfix(
+                    {"Loss": avg_train_loss, "Accuracy": train_accuracy.item()}
+                )
+
+        print(
+            f"Epoch {epoch+1}, Train Loss: {avg_train_loss}, Train Accuracy: {train_accuracy.item()}"
+        )
+
+        model.eval()
+        total_val_loss = 0
+        correct_val_predictions = 0
+        total_val_samples = 0
+
+        with tqdm(val_dataloader, desc=f"Epoch {epoch + 1} - Validation") as pbar:
+            for batch in pbar:
+                batch_inputs, batch_masks, batch_labels = batch
+                batch_inputs, batch_masks, batch_labels = (
+                    batch_inputs.to("cuda"),
+                    batch_masks.to("cuda"),
+                    batch_labels.to("cuda"),
+                )
+
+                with torch.no_grad():
+                    outputs = model(
+                        input_ids=batch_inputs,
+                        attention_mask=batch_masks,
+                        labels=batch_labels,
+                    )
+                    val_loss = outputs.loss
+                    total_val_loss += val_loss.item()
+                    _, preds = torch.max(outputs.logits, dim=1)
+                    correct_val_predictions += torch.sum(preds == batch_labels)
+                    total_val_samples += batch_labels.size(0)
+
+                    avg_val_loss = total_val_loss / len(val_dataloader)
+                    val_accuracy = correct_val_predictions.float() / total_val_samples
+
+                    pbar.set_postfix(
+                        {"Loss": avg_val_loss, "Accuracy": val_accuracy.item()}
+                    )
+
+        print(
+            f"Epoch {epoch+1}, Val Loss: {avg_val_loss}, Val Accuracy: {val_accuracy.item()}"
+        )
+
+
+def generate_question_and_options(
+    generation_model,
+    classification_model,
+    tokenizer,
+    data,
+    difficulty_level,
+    num_options=4,
+):
+    generation_model.eval()
+    classification_model.eval()
+    tokenizer.pad_token = tokenizer.eos_token
+
+    # 난이도에 맞는 데이터를 필터링
+    filtered_data = data[data["CURRICULUM_STEP_NO"] == difficulty_level]
     if filtered_data.empty:
         return "No data available for this difficulty level."
 
+    # 필터링된 데이터에서 랜덤으로 단어 선택
     selected_row = filtered_data.sample(1).iloc[0]
-    question = selected_row['QUESTION']
-    answer = selected_row['ANSWER']
+    word_to_generate_from = selected_row["QUESTION"]
+
+    # 선택된 단어를 기반으로 유사한 단어 생성
+    input_ids = tokenizer.encode(word_to_generate_from, return_tensors="pt").to("cuda")
+    outputs = generation_model.generate(
+        input_ids=input_ids,
+        max_new_tokens=1,
+        attention_mask=torch.ones_like(input_ids),
+        pad_token_id=tokenizer.eos_token_id,
+    )
+    generated_word = tokenizer.decode(outputs[0], skip_special_tokens=True)
+
+    # 잘못된 문자 제거
+    generated_word = re.sub(r"[^\w\s]", "", generated_word).replace("_", "")
+
+    # 생성된 단어를 질문으로 사용
+    question = generated_word
+
+    # 모델을 사용하여 정답과 보기를 예측
+    input_text = f"{question} [SEP] {selected_row['MEANING']}, {selected_row['DISTRACTOR_1']}, {selected_row['DISTRACTOR_2']}, {selected_row['DISTRACTOR_3']}, {selected_row['DISTRACTOR_4']}"
+    inputs = tokenizer(
+        input_text, return_tensors="pt", padding=True, truncation=True, max_length=512
+    ).to("cuda")
+    outputs = classification_model(**inputs)
+    probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+    predicted_label = torch.argmax(probs, dim=1).item()
+
+    # 예측된 정답을 기반으로 보기를 구성
+    answer = selected_row[f"DISTRACTOR_{predicted_label + 1}"]
     distractors = [
-        selected_row['DISTRACTOR_1'],
-        selected_row['DISTRACTOR_2'],
-        selected_row['DISTRACTOR_3'],
-        selected_row['DISTRACTOR_4']
+        selected_row[f"DISTRACTOR_{i}"]
+        for i in range(1, 5)
+        if i != (predicted_label + 1)
     ]
 
-    options = [answer] + distractors
-    options = options[:4]  # 선택지가 4개가 되도록 보장
+    options = distractors + [answer]
     random.shuffle(options)
-    answer_index = options.index(answer)
+    answer_index = options.index(answer) + 1
 
-    return {"question": question, "options": options, "answer": answer_index}
+    sentence = generate_sentence_with_word(
+        generation_model, tokenizer, question, max_attempts=20
+    )
 
-def remove_substring_duplicates(options, meaning):
-    filtered_options = [opt for opt in options if opt != meaning and meaning not in opt]
+    if sentence is None:
+        return generate_question_and_options(
+            generation_model,
+            classification_model,
+            tokenizer,
+            data,
+            difficulty_level,
+        )
 
-    final_options = []
-    for opt in filtered_options:
-        if not any(opt != other and (opt in other or other in opt) for other in filtered_options):
-            final_options.append(opt)
+    return {
+        "question": question,
+        "options": options[:num_options],
+        "answer": answer_index,
+        "sentence": sentence,
+    }
 
-    return final_options
 
-def step_decay_schedule(initial_lr=5e-4, decay_factor=0.9, step_size=1):
-    def schedule(epoch):
-        return initial_lr * (decay_factor ** (epoch // step_size))
-    return schedule
+def generate_sentence_with_word(
+    model, tokenizer, word, max_length=50, max_attempts=20, attempt=0
+):
+    prompt = f"Create a sentence with the word '{word}':"
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to("cuda")
+    attention_mask = torch.ones_like(input_ids).to("cuda")
 
-def train(base_model, classifier, dataloader, criterion, optimizer, device, epoch):
-    base_model.train()
-    classifier.train()
-    total_loss = 0
-    correct_predictions = 0
-    total_samples = 0
+    # 모델을 사용하여 문장 생성
+    outputs = model.generate(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        max_length=max_length,  # 최대 길이 설정 (원하는 문장의 최대 길이에 맞게 조정)
+        pad_token_id=tokenizer.eos_token_id,  # 문장 종료 토큰 사용
+        num_return_sequences=1,  # 생성할 시퀀스의 수
+        eos_token_id=tokenizer.eos_token_id,  # 종료 토큰 설정
+        no_repeat_ngram_size=1,  # 반복을 피하기 위해 설정
+        do_sample=True,  # 샘플링을 활성화
+        top_k=40,  # 상위 50개 단어만 고려
+        top_p=0.9,  # 누적 확률이 0.95 이하인 단어들만 고려
+        temperature=0.7,  # 샘플링의 다양성을 조절
+    )
 
-    with tqdm(dataloader, desc=f"Epoch {epoch + 1} - Training") as pbar:
-        for batch in pbar:
-            optimizer.zero_grad()
-            input_ids = batch[0].to(device)
-            attention_mask = batch[1].to(device)
-            labels = batch[2].to(device)
-            
-            logits = forward_pass(base_model, classifier, input_ids, attention_mask)
-            loss = criterion(logits, labels)
-            loss.backward()
-            optimizer.step()
-            total_loss += loss.item()
+    # 생성된 텍스트 디코딩
+    generated_text = tokenizer.decode(outputs[0], skip_special_tokens=True)
 
-            _, preds = torch.max(logits, dim=1)
-            correct_predictions += torch.sum(preds == labels)
-            total_samples += labels.size(0)
-        
-            avg_loss = total_loss / len(dataloader)
-            accuracy = correct_predictions.float() / total_samples
+    # 생성된 텍스트에서 프롬프트 부분 제거
+    sentence = generated_text[len(prompt) :].strip()
 
-            pbar.set_postfix({"Loss": avg_loss, "Accuracy": accuracy.item()})
+    # 잘못된 문자가 포함된 경우 다시 시도
+    sentence = re.sub(r"[\uFFFD]", "", sentence)
 
-    avg_loss = total_loss / len(dataloader)
-    accuracy = correct_predictions.float() / total_samples
-    return avg_loss, accuracy
+    # " " 사이의 문장만 추출
+    match = re.search(r'"([^"]*)"', sentence)
+    if match:
+        sentence = match.group(1)
 
-def validate(base_model, classifier, dataloader, criterion, device, epoch):
-    base_model.eval()
-    classifier.eval()
-    total_loss = 0
-    correct_predictions = 0
-    total_samples = 0
+    # 특정 text 있으면 그 뒤 텍스트를 제외
+    sentence = sentence.split(":")[0].strip()
+    sentence = sentence.split(".")[0].strip()
 
-    with tqdm(dataloader, desc=f"Epoch {epoch + 1} - Validation") as pbar:
-        for batch in pbar:
-            input_ids = batch[0].to(device)
-            attention_mask = batch[1].to(device)
-            labels = batch[2].to(device)
-            
-            logits = forward_pass(base_model, classifier, input_ids, attention_mask)
-            loss = criterion(logits, labels)
-            total_loss += loss.item()
+    # 만약 생성된 문장에 특정 단어가 포함되지 않은 경우 다시 시도
 
-            _, preds = torch.max(logits, dim=1)
-            correct_predictions += torch.sum(preds == labels)
-            total_samples += labels.size(0)
+    if word not in sentence:
+        print(
+            f"'{word}' not in generated sentence on attempt {attempt + 1}. Retrying..."
+        )
+        if attempt + 1 < max_attempts:
+            return generate_sentence_with_word(
+                model, tokenizer, word, max_length, max_attempts, attempt + 1
+            )
+        else:
+            print("Max attempts reached. Generating new question and options.")
+            return None
 
-            avg_loss = total_loss / len(dataloader)
-            accuracy = correct_predictions.float() / total_samples
+    return sentence
 
-            pbar.set_postfix({"Loss": avg_loss, "Accuracy": accuracy.item()})
 
-    avg_loss = total_loss / len(dataloader)
-    accuracy = correct_predictions.float() / total_samples
-    return avg_loss, accuracy
-
-def main(isTrain=True):
+def main(is_train=True):
     if torch.backends.mps.is_available():
         device = torch.device("mps")
         print("Using device: MPS (Apple Silicon GPU)")
@@ -200,78 +307,71 @@ def main(isTrain=True):
         print(f"Using device: {device}")
 
     current_directory = os.getcwd()
-    relative_path = os.path.join("dataset", "words_question.csv")
+
+    relative_path = os.path.join(current_directory, "dataset", "words_question.csv")
     print(f"Loading data from {relative_path}")
-    csv = pd.read_csv(os.path.join(current_directory, relative_path))
-    
-    # 데이터 전처리
+
+    csv = pd.read_csv(relative_path)
     processed_data = preprocess_data(csv)
     print("Data preprocessing completed")
 
-    train_data, val_data = train_test_split(processed_data, test_size=0.2, random_state=42)
-    print("Data split into train and validation sets")
-
-    tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+    tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
-    print("Tokenizer loaded")
 
-    train_dataset = load_dataset(train_data, tokenizer, max_length=64)
-    val_dataset = load_dataset(val_data, tokenizer, max_length=64)
-    print("Datasets loaded")
+    classification_model = GPT2ForSequenceClassification.from_pretrained(
+        "gpt2", num_labels=4
+    )
+    classification_model.config.pad_token_id = tokenizer.pad_token_id
+    classification_model.to(device)
+    optimizer = AdamW(classification_model.parameters(), lr=5e-5)
 
-    train_loader = DataLoader(train_dataset, batch_size=32, shuffle=True)
-    val_loader = DataLoader(val_dataset, batch_size=32)
-    print("Data loaders created")
+    model_save_path = os.path.join(current_directory, "trained_model")
 
-    base_model, classifier = create_model(dropout_rate=0.4)
-    base_model.to(device)
-    classifier.to(device)
-    print("Model created and moved to device")
+    if is_train:
+        input_ids, attention_masks, labels = encode_data(processed_data, tokenizer)
+        print("Data encoding completed")
 
-    optimizer = AdamW(list(base_model.parameters()) + list(classifier.parameters()), lr=5e-4)
-    scheduler = ReduceLROnPlateau(optimizer, mode='min', factor=0.9, patience=2)
-    criterion = nn.CrossEntropyLoss()
-    print("Optimizer, scheduler, and criterion set up")
+        train_dataloader, val_dataloader = create_data_loaders(
+            input_ids, attention_masks, labels, batch_size=16
+        )
+        print("Data loaders created")
 
-    if isTrain:
-        total_epoch = 5
-        early_stopping_patience = 3
-        best_val_loss = float('inf')
-        patience_counter = 0
+        train_model(classification_model, train_dataloader, val_dataloader, optimizer)
 
-        for epoch in range(total_epoch):
-            print(f"Epoch {epoch + 1} / {total_epoch}")
-            train_loss, train_acc = train(base_model, classifier, train_loader, criterion, optimizer, device, epoch)
-            val_loss, val_acc = validate(base_model, classifier, val_loader, criterion, device, epoch)
+        # 모델 저장
+        os.makedirs(model_save_path, exist_ok=True)
+        classification_model.save_pretrained(model_save_path)
+        tokenizer.save_pretrained(model_save_path)
 
-            print(f"Epoch {epoch + 1} completed. Train Loss: {train_loss:.4f}, Train Accuracy: {train_acc:.4f}, Val Loss: {val_loss:.4f}, Val Accuracy: {val_acc:.4f}")
-
-            scheduler.step(val_loss)
-
-            if val_loss < best_val_loss:
-                best_val_loss = val_loss
-                patience_counter = 0
-                torch.save({
-                    'base_model_state_dict': base_model.state_dict(),
-                    'classifier_state_dict': classifier.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict()
-                }, 'best_model.pth')
-                print("Best model saved")
-            else:
-                patience_counter += 1
-                if patience_counter >= early_stopping_patience:
-                    print("Early stopping")
-                    break
+        print(f"Classification model and tokenizer saved to {model_save_path}")
     else:
-        print("Loading best model for evaluation")
-        checkpoint = torch.load('best_model.pth')
-        base_model.load_state_dict(checkpoint['base_model_state_dict'])
-        classifier.load_state_dict(checkpoint['classifier_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        # 모델 로드
+        if os.path.exists(model_save_path):
+            classification_model = GPT2ForSequenceClassification.from_pretrained(
+                model_save_path
+            )
+            tokenizer = GPT2Tokenizer.from_pretrained(model_save_path)
+            classification_model.to(device)
+            print(f"Classification model and tokenizer loaded from {model_save_path}")
+        else:
+            print(f"Model path {model_save_path} does not exist.")
+            return
 
+    # 텍스트 생성 모델 로드
+    generation_model = GPT2LMHeadModel.from_pretrained("gpt2-medium")
+    generation_model.to(device)
+
+    # 난이도 수준을 입력하여 질문 생성
     difficulty_level = 33
-    generated_question = generate_question(train_data, difficulty_level)
+    generated_question = generate_question_and_options(
+        generation_model,
+        classification_model,
+        tokenizer,
+        processed_data,
+        difficulty_level,
+    )
     print(f"Generated question: {generated_question}")
 
-if __name__ == '__main__':
-    main(isTrain=True)
+
+if __name__ == "__main__":
+    main(is_train=False)
