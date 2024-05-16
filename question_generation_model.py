@@ -2,6 +2,9 @@ import os
 import pandas as pd
 import torch
 import re
+import torch.nn.functional as F
+import numpy as np
+from torch.nn.utils.rnn import pad_sequence
 from torch.utils.data import DataLoader, TensorDataset
 from transformers import (
     GPT2Tokenizer,
@@ -10,6 +13,7 @@ from transformers import (
     get_scheduler,
     AdamW,
 )
+import torch.nn as nn
 from tqdm import tqdm
 import random
 
@@ -161,6 +165,28 @@ def train_model(model, train_dataloader, val_dataloader, optimizer, num_epochs=3
             f"Epoch {epoch+1}, Val Loss: {avg_val_loss}, Val Accuracy: {val_accuracy.item()}"
         )
 
+def find_similar_words(seed_word, model, device, tokenizer, num_words=3):
+    # 문장을 완성하여 비슷한 의미의 단어들을 생성
+    input_ids = tokenizer.encode(seed_word + " is similar to", return_tensors="pt").to(device)
+    outputs = model.generate(
+        input_ids,
+        max_length=50,
+        num_return_sequences=num_words,
+        pad_token_id=tokenizer.eos_token_id,
+        do_sample=True,  # 샘플링 활성화
+        top_k=50  # 상위 50개 토큰 중 선택
+    )
+
+    similar_words = []
+    for output in outputs:
+        text = tokenizer.decode(output, skip_special_tokens=True)
+        words = text.split()
+        for word in words:
+            if word.lower() != seed_word.lower() and word.isalpha() and word.lower() not in similar_words:
+                similar_words.append(word.lower())
+                if len(similar_words) >= num_words:
+                    return similar_words
+    return similar_words
 
 def generate_question_and_options(
     generation_model,
@@ -168,6 +194,7 @@ def generate_question_and_options(
     tokenizer,
     data,
     difficulty_level,
+    device,
     num_options=4,
 ):
     generation_model.eval()
@@ -179,49 +206,36 @@ def generate_question_and_options(
     if filtered_data.empty:
         return "No data available for this difficulty level."
 
-    # 필터링된 데이터에서 랜덤으로 단어 선택
-    selected_row = filtered_data.sample(1).iloc[0]
-    word_to_generate_from = selected_row["QUESTION"]
+    # 난이도에 맞는 데이터 필터링은 제거
+    # 단어 생성
+    current_directory = os.getcwd()
+    word_train_path = os.path.join(current_directory, "saved_model")
+    model_path = os.path.join(word_train_path, "word_generation_model.pth")
+    model_parts, word_vocab, level_vocab = load_model_and_vocab(model_path, device=device)
+    
+    max_sequence_len = 20  # 최대 시퀀스 길이
+    generated_word = generate_word(model_parts, word_vocab, level_vocab, difficulty_level, max_sequence_len, device=device)
+    
+    print('Generated word:', generated_word)
+    
+    # 비슷한 단어 찾기
+    similar_words = find_similar_words(generated_word, generation_model, device, tokenizer, num_options - 1)
 
-    # 선택된 단어를 기반으로 유사한 단어 생성
-    input_ids = tokenizer.encode(word_to_generate_from, return_tensors="pt").to("cuda")
-    outputs = generation_model.generate(
-        input_ids=input_ids,
-        max_new_tokens=1,
-        attention_mask=torch.ones_like(input_ids),
-        pad_token_id=tokenizer.eos_token_id,
-    )
-    generated_word = tokenizer.decode(outputs[0], skip_special_tokens=True)
-
-    # 잘못된 문자 제거
-    generated_word = re.sub(r"[^\w\s]", "", generated_word).replace("_", "")
-
-    # 생성된 단어를 질문으로 사용
+    # 생성된 단어를 사용하여 질문 구성
     question = generated_word
 
-    # 모델을 사용하여 정답과 보기를 예측
-    input_text = f"{question} [SEP] {selected_row['MEANING']}, {selected_row['DISTRACTOR_1']}, {selected_row['DISTRACTOR_2']}, {selected_row['DISTRACTOR_3']}, {selected_row['DISTRACTOR_4']}"
-    inputs = tokenizer(
-        input_text, return_tensors="pt", padding=True, truncation=True, max_length=512
-    ).to("cuda")
-    outputs = classification_model(**inputs)
-    probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
-    predicted_label = torch.argmax(probs, dim=1).item()
+    # 보기 생성
+    if len(similar_words) < num_options - 1:
+        print("Not enough similar words found, filling with random words.")
+        while len(similar_words) < num_options - 1:
+            similar_words.append(generated_word[::-1])  # 예시로 뒤집은 단어 추가
 
-    # 예측된 정답을 기반으로 보기를 구성
-    answer = selected_row[f"DISTRACTOR_{predicted_label + 1}"]
-    distractors = [
-        selected_row[f"DISTRACTOR_{i}"]
-        for i in range(1, 5)
-        if i != (predicted_label + 1)
-    ]
-
-    options = distractors + [answer]
+    options = similar_words + [generated_word]
     random.shuffle(options)
-    answer_index = options.index(answer) + 1
+    answer_index = options.index(generated_word) + 1
 
     sentence = generate_sentence_with_word(
-        generation_model, tokenizer, question, max_attempts=20
+        generation_model, tokenizer, question, device, max_attempts=20
     )
 
     if sentence is None:
@@ -231,6 +245,7 @@ def generate_question_and_options(
             tokenizer,
             data,
             difficulty_level,
+            device
         )
 
     return {
@@ -242,11 +257,11 @@ def generate_question_and_options(
 
 
 def generate_sentence_with_word(
-    model, tokenizer, word, max_length=50, max_attempts=20, attempt=0
+    model, tokenizer, word, device, max_length=50, max_attempts=20, attempt=0
 ):
     prompt = f"Create a sentence with the word '{word}':"
-    input_ids = tokenizer.encode(prompt, return_tensors="pt").to("cuda")
-    attention_mask = torch.ones_like(input_ids).to("cuda")
+    input_ids = tokenizer.encode(prompt, return_tensors="pt").to(device)
+    attention_mask = torch.ones_like(input_ids).to(device)
 
     # 모델을 사용하여 문장 생성
     outputs = model.generate(
@@ -258,8 +273,8 @@ def generate_sentence_with_word(
         eos_token_id=tokenizer.eos_token_id,  # 종료 토큰 설정
         no_repeat_ngram_size=1,  # 반복을 피하기 위해 설정
         do_sample=True,  # 샘플링을 활성화
-        top_k=40,  # 상위 50개 단어만 고려
-        top_p=0.9,  # 누적 확률이 0.95 이하인 단어들만 고려
+        top_k=40,  # 상위 40개 단어만 고려
+        top_p=0.9,  # 누적 확률이 0.9 이하인 단어들만 고려
         temperature=0.7,  # 샘플링의 다양성을 조절
     )
 
@@ -282,14 +297,13 @@ def generate_sentence_with_word(
     sentence = sentence.split(".")[0].strip()
 
     # 만약 생성된 문장에 특정 단어가 포함되지 않은 경우 다시 시도
-
     if word not in sentence:
         print(
             f"'{word}' not in generated sentence on attempt {attempt + 1}. Retrying..."
         )
         if attempt + 1 < max_attempts:
             return generate_sentence_with_word(
-                model, tokenizer, word, max_length, max_attempts, attempt + 1
+                model, tokenizer, word, device, max_length, max_attempts, attempt + 1
             )
         else:
             print("Max attempts reached. Generating new question and options.")
@@ -297,6 +311,71 @@ def generate_sentence_with_word(
 
     return sentence
 
+def generate_word(model_parts, word_vocab, level_vocab, difficulty_level, max_sequence_len, device='cpu'):
+    word_embedding, level_embedding, lstm, fc = model_parts
+    lstm.eval()
+
+    level_input = torch.tensor([level_vocab[str(difficulty_level)]], device=device)
+    level_embed = level_embedding(level_input)
+
+    valid_start_words = [v for k, v in word_vocab.items() if k != '<pad>']
+    current_input = torch.tensor([random.choice(valid_start_words)], device=device)
+    
+    generated_word = ''
+    word_embed = word_embedding(current_input).unsqueeze(0)
+    concat_embed = torch.cat((word_embed, level_embed.unsqueeze(0)), dim=-1)
+        
+    output, hidden = lstm(concat_embed)
+    logits = fc(output.squeeze(0))
+    probs = torch.softmax(logits, dim=-1)
+
+    pad_index = word_vocab['<pad>']
+    probs[0][pad_index] = 0  # Set the probability of the <pad> token to zero
+
+    # Renormalize probabilities after setting <pad> to zero
+    probs /= torch.sum(probs)
+
+    next_token_id = torch.argmax(probs, dim=-1).item()
+    next_word = {v: k for k, v in word_vocab.items()}.get(next_token_id, None)
+        
+    generated_word += next_word + ' '
+    current_input = torch.tensor([next_token_id], device=device)
+
+    return generated_word.strip()
+
+def build_model(vocab_size, level_vocab_size, embedding_dim=64, lstm_units=20):
+    word_embedding = nn.Embedding(vocab_size, embedding_dim, padding_idx=0)
+    level_embedding = nn.Embedding(level_vocab_size, embedding_dim)
+    lstm = nn.LSTM(embedding_dim * 2, lstm_units, batch_first=True)
+    fc = nn.Linear(lstm_units, vocab_size)
+    return word_embedding, level_embedding, lstm, fc
+
+def forward(word_embedding, level_embedding, lstm, fc, word_input, level_input):
+    word_embed = word_embedding(word_input)
+    level_embed = level_embedding(level_input).unsqueeze(1).repeat(1, word_embed.size(1), 1)
+    concat = torch.cat((word_embed, level_embed), dim=-1)
+    lstm_out, _ = lstm(concat)
+    out = fc(lstm_out[:, -1, :])
+    return out
+
+# 모델과 토크나이저 로드
+def load_model_and_vocab(model_path, device='cpu'):
+    checkpoint = torch.load(model_path, map_location=device)
+    word_embedding, level_embedding, lstm, fc = build_model(len(checkpoint['word_vocab']), len(checkpoint['level_vocab']))
+    word_embedding.load_state_dict(checkpoint['word_embedding'])
+    level_embedding.load_state_dict(checkpoint['level_embedding'])
+    lstm.load_state_dict(checkpoint['lstm'])
+    fc.load_state_dict(checkpoint['fc'])
+    
+    word_vocab = checkpoint['word_vocab']
+    level_vocab = checkpoint['level_vocab']
+
+    word_embedding.to(device)
+    level_embedding.to(device)
+    lstm.to(device)
+    fc.to(device)
+
+    return (word_embedding, level_embedding, lstm, fc), word_vocab, level_vocab
 
 def main(is_train=True):
     if torch.backends.mps.is_available():
@@ -306,15 +385,6 @@ def main(is_train=True):
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
 
-    current_directory = os.getcwd()
-
-    relative_path = os.path.join(current_directory, "dataset", "words_question.csv")
-    print(f"Loading data from {relative_path}")
-
-    csv = pd.read_csv(relative_path)
-    processed_data = preprocess_data(csv)
-    print("Data preprocessing completed")
-
     tokenizer = GPT2Tokenizer.from_pretrained("gpt2")
     tokenizer.pad_token = tokenizer.eos_token
 
@@ -323,11 +393,20 @@ def main(is_train=True):
     )
     classification_model.config.pad_token_id = tokenizer.pad_token_id
     classification_model.to(device)
-    optimizer = AdamW(classification_model.parameters(), lr=5e-5)
-
+    
+     # 텍스트 생성 모델 로드
+    generation_model = GPT2LMHeadModel.from_pretrained("gpt2-medium")
+    generation_model.to(device)
+    
+    current_directory = os.getcwd()
+    relative_path = os.path.join(current_directory, "dataset", "words_question.csv")
+    csv = pd.read_csv(relative_path)
+    processed_data = preprocess_data(csv)
+    
     model_save_path = os.path.join(current_directory, "trained_model")
 
     if is_train:
+        optimizer = AdamW(classification_model.parameters(), lr=5e-5)
         input_ids, attention_masks, labels = encode_data(processed_data, tokenizer)
         print("Data encoding completed")
 
@@ -356,19 +435,16 @@ def main(is_train=True):
         else:
             print(f"Model path {model_save_path} does not exist.")
             return
-
-    # 텍스트 생성 모델 로드
-    generation_model = GPT2LMHeadModel.from_pretrained("gpt2-medium")
-    generation_model.to(device)
-
-    # 난이도 수준을 입력하여 질문 생성
+    
     difficulty_level = 33
+    
     generated_question = generate_question_and_options(
         generation_model,
         classification_model,
         tokenizer,
         processed_data,
         difficulty_level,
+        device
     )
     print(f"Generated question: {generated_question}")
 
