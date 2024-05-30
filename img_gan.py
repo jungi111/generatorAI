@@ -7,6 +7,20 @@ import matplotlib.pyplot as plt
 import torchvision.utils as vutils
 import numpy as np
 import os
+import psutil
+
+# 시드 고정
+manualSeed = 999
+np.random.seed(manualSeed)
+torch.manual_seed(manualSeed)
+if torch.cuda.is_available():
+    torch.cuda.manual_seed_all(manualSeed)
+
+# 메모리 사용량 확인 함수
+def check_memory_usage():
+    print(f"GPU Memory Allocated: {torch.cuda.memory_allocated()}")
+    print(f"GPU Memory Cached: {torch.cuda.memory_reserved()}")
+    print(f"System Memory Used: {psutil.virtual_memory().percent}%")
 
 # GAN 생성자 정의
 def create_generator(nz):
@@ -73,31 +87,33 @@ def gradient_penalty(discriminator, real_data, fake_data, device):
 
     return gradient_penalty
 
-def train_gan(num_epochs, dataloader, nz, device):
+def train_gan(num_epochs, dataloader, nz, device, batch_size):
     netG = create_generator(nz).to(device)
     netD = create_discriminator().to(device)
     
     netG.apply(weights_init)
     netD.apply(weights_init)
-
-    optimizerD = optim.Adam(netD.parameters(), lr=0.00001, betas=(0.5, 0.999))  # 학습률을 더 낮춤
-    optimizerG = optim.Adam(netG.parameters(), lr=0.00001, betas=(0.5, 0.999))
     
     G_losses = []
     D_losses = []
-    gp_lambda = 5  # Gradient Penalty 파라미터 조정
-    n_critic = 3  # 판별자 업데이트 횟수 조정
+    gp_lambda = 5
+    n_critic = 3
+    num_row = 8
+    learning_rate = 0.00001
     
-    fixed_noise = torch.randn(16, nz, 1, 1, device=device)  # 배치 크기 줄임
+    optimizerD = optim.Adam(netD.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+    optimizerG = optim.Adam(netG.parameters(), lr=learning_rate, betas=(0.5, 0.999))
+    
+    fixed_noise = torch.randn(batch_size, nz, 1, 1, device=device)
     
     output_dir = './output'
     os.makedirs(output_dir, exist_ok=True)
 
     plt.ion()
-    fig, axs = plt.subplots(1, 2, figsize=(7, 7))
+    fig, axs = plt.subplots(1, 2, figsize=(10, 10))
     
     real_batch = next(iter(dataloader))[0].to(device)
-    axs[0].imshow(np.transpose(vutils.make_grid(real_batch[:16], nrow=4, padding=5, normalize=True).cpu(), (1, 2, 0)))
+    axs[0].imshow(np.transpose(vutils.make_grid(real_batch[:batch_size], nrow=num_row, padding=5, normalize=True).cpu(), (1, 2, 0)))
     axs[0].set_title("Real Images")
     axs[0].axis("off")
 
@@ -130,25 +146,42 @@ def train_gan(num_epochs, dataloader, nz, device):
                     G_losses.append(errG.item())
 
                 if i % 100 == 0:
+                    check_memory_usage()  # 메모리 사용량 확인
                     print(f'[{epoch}/{num_epochs}][{i}/{len(dataloader)}] Loss_D: {errD.item()} Loss_G: {errG.item()}')
-                    vutils.save_image(fake.detach(), f'{output_dir}/fake_samples_epoch_{epoch}_batch_{i}.png', nrow=4, normalize=True)
+                    vutils.save_image(fake.detach(), f'{output_dir}/fake_samples_epoch_{epoch}_batch_{i}.png', nrow=num_row, normalize=True)
 
                     # 생성된 이미지 시각화
                     with torch.no_grad():
                         fake = netG(fixed_noise).detach().cpu()
                     axs[1].clear()
-                    axs[1].imshow(np.transpose(vutils.make_grid(fake, nrow=4, padding=5, normalize=True), (1, 2, 0)))
+                    axs[1].imshow(np.transpose(vutils.make_grid(fake, nrow=num_row, padding=5, normalize=True), (1, 2, 0)))
                     axs[1].set_title("Fake Images")
                     axs[1].axis("off")
                     plt.pause(0.001)
+
+                # 매 에포크마다 메모리 정리
+                if i % 10 == 0:
+                    torch.cuda.empty_cache()
             except Exception as e:
                 print(f'Error at epoch {epoch}, batch {i}: {str(e)}')
                 continue
+
+        # 체크포인트 저장
+        torch.save({
+            'epoch': epoch,
+            'netG_state_dict': netG.state_dict(),
+            'netD_state_dict': netD.state_dict(),
+            'optimizerG_state_dict': optimizerG.state_dict(),
+            'optimizerD_state_dict': optimizerD.state_dict(),
+            'G_losses': G_losses,
+            'D_losses': D_losses,
+        }, os.path.join(output_dir, f'checkpoint_epoch_{epoch}.pth'))
 
     plt.ioff()
     plt.show()
     
     return netG, netD
+
 
 def main():
     if torch.backends.mps.is_available():
@@ -158,6 +191,10 @@ def main():
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         print(f"Using device: {device}")
         
+    nz = 100  # 잠재 공간 벡터 크기
+    num_epochs = 25
+    batch_size = 32  # 배치 크기를 더 줄임
+    
     transform = transforms.Compose(
         [
             transforms.Resize(64),
@@ -171,13 +208,17 @@ def main():
         root="./cifar10/train", train=True, download=True, transform=transform
     )
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=16, shuffle=True, num_workers=2  # 배치 크기 줄임
+        dataset, batch_size=batch_size, shuffle=True, num_workers=0  # num_workers=0 설정
     )
     
-    nz = 100  # 잠재 공간 벡터 크기
-    num_epochs = 25
+    # 데이터셋의 모든 배치를 미리 검사하는 코드 추가
+    for i, data in enumerate(dataloader, 0):
+        try:
+            inputs, labels = data
+        except Exception as e:
+            print(f'Error in batch {i}: {str(e)}')
     
-    netG, netD = train_gan(num_epochs, dataloader, nz, device)
+    netG, netD = train_gan(num_epochs, dataloader, nz, device, batch_size)
         
 if __name__ == "__main__":
     main()
