@@ -8,6 +8,7 @@ import torchvision.utils as vutils
 import numpy as np
 import os
 import psutil
+import torch.nn.functional as F
 
 # 시드 고정
 manualSeed = 999
@@ -21,6 +22,23 @@ def check_memory_usage():
     print(f"GPU Memory Allocated: {torch.cuda.memory_allocated()}")
     print(f"GPU Memory Cached: {torch.cuda.memory_reserved()}")
     print(f"System Memory Used: {psutil.virtual_memory().percent}%")
+    
+def self_attention(x):
+    batch_size, C, width, height = x.size()
+    query_conv = nn.Conv2d(in_channels=C, out_channels=C // 8, kernel_size=1).to(x.device)
+    key_conv = nn.Conv2d(in_channels=C, out_channels=C // 8, kernel_size=1).to(x.device)
+    value_conv = nn.Conv2d(in_channels=C, out_channels=C, kernel_size=1).to(x.device)
+    gamma = nn.Parameter(torch.zeros(1)).to(x.device)
+
+    proj_query = query_conv(x).view(batch_size, -1, width * height).permute(0, 2, 1)
+    proj_key = key_conv(x).view(batch_size, -1, width * height)
+    energy = torch.bmm(proj_query, proj_key)
+    attention = F.softmax(energy, dim=-1)
+    proj_value = value_conv(x).view(batch_size, -1, width * height)
+    out = torch.bmm(proj_value, attention.permute(0, 2, 1))
+    out = out.view(batch_size, C, width, height)
+    out = gamma * out + x
+    return out
 
 # GAN 생성자 정의
 def create_generator(nz):
@@ -42,6 +60,12 @@ def create_generator(nz):
     )
     return generator
 
+def forward_generator(x, generator):
+    x = generator[0:7](x)
+    x = self_attention(x)  # Self-Attention 적용
+    x = generator[7:](x)
+    return x
+
 # GAN 판별자 정의
 def create_discriminator():
     discriminator = nn.Sequential(
@@ -60,6 +84,12 @@ def create_discriminator():
         nn.Flatten()
     )
     return discriminator
+
+def forward_discriminator(x, discriminator):
+    x = discriminator[0:7](x)
+    x = self_attention(x)  # Self-Attention 적용
+    x = discriminator[7:](x)
+    return x
 
 def weights_init(m):
     classname = m.__class__.__name__
@@ -125,10 +155,10 @@ def train_gan(num_epochs, dataloader, nz, device, batch_size):
                 batch_size = real.size(0)
                 
                 noise = torch.randn(batch_size, nz, 1, 1, device=device)
-                fake = netG(noise)
+                fake = forward_generator(noise, netG)  # 수정된 부분
                 
-                output_real = netD(real).view(-1)
-                output_fake = netD(fake.detach()).view(-1)
+                output_real = forward_discriminator(real, netD).view(-1)  # 수정된 부분
+                output_fake = forward_discriminator(fake.detach(), netD).view(-1)  # 수정된 부분
                 gradient_pen = gradient_penalty(netD, real, fake.detach(), device)
                 errD = -torch.mean(output_real) + torch.mean(output_fake) + gp_lambda * gradient_pen
                 errD.backward()
@@ -138,7 +168,7 @@ def train_gan(num_epochs, dataloader, nz, device, batch_size):
 
                 if i % n_critic == 0:
                     netG.zero_grad()
-                    output_fake = netD(fake).view(-1)
+                    output_fake = forward_discriminator(fake, netD).view(-1)  # 수정된 부분
                     errG = -torch.mean(output_fake)
                     errG.backward()
                     optimizerG.step()
@@ -146,41 +176,26 @@ def train_gan(num_epochs, dataloader, nz, device, batch_size):
                     G_losses.append(errG.item())
 
                 if i % 100 == 0:
-                    check_memory_usage()  # 메모리 사용량 확인
                     print(f'[{epoch}/{num_epochs}][{i}/{len(dataloader)}] Loss_D: {errD.item()} Loss_G: {errG.item()}')
                     vutils.save_image(fake.detach(), f'{output_dir}/fake_samples_epoch_{epoch}_batch_{i}.png', nrow=num_row, normalize=True)
 
                     # 생성된 이미지 시각화
                     with torch.no_grad():
-                        fake = netG(fixed_noise).detach().cpu()
+                        fake = forward_generator(fixed_noise, netG).detach().cpu()  # 수정된 부분
                     axs[1].clear()
                     axs[1].imshow(np.transpose(vutils.make_grid(fake, nrow=num_row, padding=5, normalize=True), (1, 2, 0)))
                     axs[1].set_title("Fake Images")
                     axs[1].axis("off")
                     plt.pause(0.001)
-
-                # 매 에포크마다 메모리 정리
-                if i % 10 == 0:
-                    torch.cuda.empty_cache()
             except Exception as e:
                 print(f'Error at epoch {epoch}, batch {i}: {str(e)}')
                 continue
-
-        # 체크포인트 저장
-        torch.save({
-            'epoch': epoch,
-            'netG_state_dict': netG.state_dict(),
-            'netD_state_dict': netD.state_dict(),
-            'optimizerG_state_dict': optimizerG.state_dict(),
-            'optimizerD_state_dict': optimizerD.state_dict(),
-            'G_losses': G_losses,
-            'D_losses': D_losses,
-        }, os.path.join(output_dir, f'checkpoint_epoch_{epoch}.pth'))
 
     plt.ioff()
     plt.show()
     
     return netG, netD
+
 
 
 def main():
@@ -193,8 +208,8 @@ def main():
         
     nz = 100  # 잠재 공간 벡터 크기
     num_epochs = 25
-    batch_size = 32  # 배치 크기를 더 줄임
-    
+    batch_size = 64
+        
     transform = transforms.Compose(
         [
             transforms.Resize(64),
@@ -208,7 +223,7 @@ def main():
         root="./cifar10/train", train=True, download=True, transform=transform
     )
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=0  # num_workers=0 설정
+        dataset, batch_size=batch_size, shuffle=True, num_workers=2
     )
     
     # 데이터셋의 모든 배치를 미리 검사하는 코드 추가
