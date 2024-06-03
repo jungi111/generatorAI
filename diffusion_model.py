@@ -9,12 +9,16 @@ from tqdm import tqdm
 
 # 모델 정의
 class UNet(nn.Module):
-    def __init__(self, channels, embed_dim=256):
+    def __init__(self, channels, embed_dim=512):
         super(UNet, self).__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(channels + embed_dim, 64, 3, 2, 1),  # 첫 번째 합성곱 층의 채널 수를 64로 설정
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(128, 256, 3, 2, 1),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(256, 512, 3, 2, 1),
             nn.ReLU(inplace=True),
         )
         self.time_embedding = nn.Sequential(
@@ -24,18 +28,20 @@ class UNet(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(128, 64, 4, 2, 1),  # 디코더의 채널 수 조정
+            nn.ConvTranspose2d(512, 256, 4, 2, 1),  # 16x16 -> 32x32
             nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(64, channels, 4, 2, 1),
+            nn.ConvTranspose2d(256, 128, 4, 2, 1),  # 32x32 -> 64x64
             nn.ReLU(inplace=True),
-            nn.Conv2d(channels, channels, 3, 1, 1),
+            nn.ConvTranspose2d(128, 64, 4, 2, 1),   # 64x64 -> 128x128
+            nn.ReLU(inplace=True),
+            nn.ConvTranspose2d(64, channels, 4, 2, 1),  # 128x128 -> 256x256
         )
 
     def forward(self, x, t):
-        t = t.float()  # t를 float 타입으로 변환
+        t = t.float()
         t = self.time_embedding(t.unsqueeze(-1)).unsqueeze(-1).unsqueeze(-1)
-        t = t.expand(x.size(0), 256, x.size(2), x.size(3))  # 배치 크기에 맞춰 확장
-        x = torch.cat((x, t), dim=1)  # 시계열 정보 채널 추가
+        t = t.expand(x.size(0), t.size(1), x.size(2), x.size(3))
+        x = torch.cat((x, t), dim=1)
         x = self.encoder(x)
         x = self.decoder(x)
         return x
@@ -83,24 +89,24 @@ def train(
             optimizer.step()
             epoch_loss += loss.item()
 
-            if (i + 1) % 150 == 0:  # 배치 인덱스를 기준으로 50 배치마다 시각화
-                model.eval()
-                with torch.no_grad():
-                    sample_img = sample(
-                        model, x.size(2), x.size(1), timesteps, device, scheduler
-                    )
-                sample_img = (
-                    sample_img.cpu().detach().numpy().transpose(0, 2, 3, 1).squeeze()
-                )
-                sample_img = (sample_img + 1) / 2  # Normalize to [0, 1]
-                sample_img = np.clip(sample_img, 0, 1)  # 값을 [0, 1] 범위로 클리핑
+            # if (i + 1) % 150 == 0:  # 배치 인덱스를 기준으로 50 배치마다 시각화
+            #     model.eval()
+            #     with torch.no_grad():
+            #         sample_img = sample(
+            #             model, x.size(2), x.size(1), timesteps, device, scheduler
+            #         )
+            #     sample_img = (
+            #         sample_img.cpu().detach().numpy().transpose(0, 2, 3, 1).squeeze()
+            #     )
+            #     sample_img = (sample_img + 1) / 2  # Normalize to [0, 1]
+            #     sample_img = np.clip(sample_img, 0, 1)  # 값을 [0, 1] 범위로 클리핑
 
-                ax.clear()
-                ax.imshow(sample_img)
-                ax.set_title("Generated Image")
-                ax.axis("off")
-                plt.pause(0.01)
-                model.train()
+            #     ax.clear()
+            #     ax.imshow(sample_img)
+            #     ax.set_title("Generated Image")
+            #     ax.axis("off")
+            #     plt.pause(0.01)
+            #     model.train()
 
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss / len(dataloader)}")
 
@@ -168,7 +174,7 @@ def main():
         dataset, batch_size=batch_size, shuffle=True, num_workers=6
     )
 
-    model = UNet(channels, embed_dim=256).to(device)  # 임베딩 차원을 256으로 설정
+    model = UNet(channels, embed_dim=512).to(device)  # 임베딩 차원을 256으로 설정
     optimizer = optim.Adam(model.parameters(), lr=lr)
     scheduler = linear_beta_schedule(timesteps, beta1, beta2).to(device)
     train(
