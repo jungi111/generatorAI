@@ -15,13 +15,13 @@ class UNet(nn.Module):
         super(UNet, self).__init__()
         self.encoder = nn.Sequential(
             nn.Conv2d(channels + embed_dim, 64, 3, 2, 1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),  # BatchNorm2d -> GroupNorm
             nn.ReLU(inplace=True),
             nn.Conv2d(64, 128, 3, 2, 1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),  # BatchNorm2d -> GroupNorm
             nn.ReLU(inplace=True),
             nn.Conv2d(128, 256, 3, 2, 1),
-            nn.BatchNorm2d(256),
+            nn.GroupNorm(8, 256),  # BatchNorm2d -> GroupNorm
             nn.ReLU(inplace=True),
         )
         self.time_embedding = nn.Sequential(
@@ -32,10 +32,10 @@ class UNet(nn.Module):
         )
         self.decoder = nn.Sequential(
             nn.ConvTranspose2d(256, 128, 4, 2, 1),
-            nn.BatchNorm2d(128),
+            nn.GroupNorm(8, 128),  # BatchNorm2d -> GroupNorm
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(128, 64, 4, 2, 1),
-            nn.BatchNorm2d(64),
+            nn.GroupNorm(8, 64),  # BatchNorm2d -> GroupNorm
             nn.ReLU(inplace=True),
             nn.ConvTranspose2d(64, channels, 4, 2, 1),
         )
@@ -134,6 +134,7 @@ def train(
 
     torch.save(model.state_dict(), model_save_path)
     print(f"Model saved to {model_save_path}")
+    print("Training Finish")
 
     plt.ioff()  # 인터랙티브 모드 비활성화
     plt.show()  # 시각화 창 표시
