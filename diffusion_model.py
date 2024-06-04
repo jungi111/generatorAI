@@ -23,18 +23,6 @@ class UNet(nn.Module):
             nn.Conv2d(128, 256, 3, 2, 1),
             nn.BatchNorm2d(256),
             nn.ReLU(inplace=True),
-            nn.Conv2d(256, 512, 3, 2, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, 1024, 3, 2, 1),
-            nn.BatchNorm2d(1024),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(1024, 2048, 3, 2, 1),
-            nn.BatchNorm2d(2048),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(2048, 4096, 3, 2, 1),  # 추가된 층
-            nn.BatchNorm2d(4096),
-            nn.ReLU(inplace=True),
         )
         self.time_embedding = nn.Sequential(
             nn.Linear(1, embed_dim),
@@ -43,18 +31,6 @@ class UNet(nn.Module):
             nn.ReLU(inplace=True),
         )
         self.decoder = nn.Sequential(
-            nn.ConvTranspose2d(4096, 2048, 4, 2, 1),  # 추가된 층
-            nn.BatchNorm2d(2048),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(2048, 1024, 4, 2, 1),
-            nn.BatchNorm2d(1024),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(1024, 512, 4, 2, 1),
-            nn.BatchNorm2d(512),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose2d(512, 256, 4, 2, 1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
             nn.ConvTranspose2d(256, 128, 4, 2, 1),
             nn.BatchNorm2d(128),
             nn.ReLU(inplace=True),
@@ -91,11 +67,11 @@ def linear_beta_schedule(timesteps, beta1, beta2):
 
 
 # DDPM 손실 함수
-def ddpm_loss(model, x_0, t, beta_t):
+def ddpm_loss(model, x_0, t, alpha_bar):
     noise = torch.randn_like(x_0)  # 랜덤 노이즈 생성
-    x_t = x_0 * torch.sqrt(1 - beta_t) + noise * torch.sqrt(beta_t)  # 노이즈 추가
+    x_t = torch.sqrt(alpha_bar) * x_0 + torch.sqrt(1 - alpha_bar) * noise  # 노이즈 추가
     noise_pred = model(x_t, t)
-    return nn.SmoothL1Loss()(noise_pred, noise)  # Smooth L1 손실 함수 사용
+    return nn.MSELoss()(noise_pred, noise)  # MSE 손실 함수 사용
 
 
 # 학습 함수
@@ -116,19 +92,16 @@ def train(
     ax.set_title("Generated Image")
     ax.axis("off")
 
-    lr_scheduler = optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode="min", factor=0.2, patience=5
-    )
-
     for epoch in range(num_epochs):
         epoch_loss = 0
         for i, (x, _) in enumerate(
             tqdm(dataloader, desc=f"Epoch {epoch+1}/{num_epochs}")
         ):
             x = x.to(device)
-            t = torch.randint(0, timesteps, (x.size(0),), device=device).long()
-            beta_t = scheduler[t].unsqueeze(1).unsqueeze(2).unsqueeze(3).expand_as(x)
-            loss = ddpm_loss(model, x, t, beta_t)
+            t = torch.randint(1, timesteps + 1, (x.size(0),), device=device).long()
+            alpha_bar_t = scheduler[t].cumprod(dim=0)  # \bar{\alpha}_t 계산
+            alpha_bar_t = alpha_bar_t.view(-1, 1, 1, 1).to(x.device)  # 브로드캐스팅을 위해 view 사용
+            loss = ddpm_loss(model, x, t, alpha_bar_t)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
@@ -144,6 +117,7 @@ def train(
                     sample_img.cpu().detach().numpy().transpose(0, 2, 3, 1).squeeze()
                 )
                 sample_img = (sample_img + 1) / 2  # Normalize to [0, 1]
+                sample_img = np.nan_to_num(sample_img) 
                 sample_img = np.clip(sample_img, 0, 1)  # 값을 [0, 1] 범위로 클리핑
 
                 ax.clear()
@@ -153,7 +127,6 @@ def train(
                 plt.pause(0.01)
                 model.train()
 
-        lr_scheduler.step(epoch_loss / len(dataloader))
         print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss / len(dataloader)}")
 
         checkpoint_path = f"{model_save_path}_checkpoint.pth"
@@ -170,32 +143,69 @@ def train(
 def sample(model, image_size, channels, timesteps, device, scheduler):
     model.eval()
     with torch.no_grad():
-        x = torch.randn(1, channels, image_size, image_size, device=device)
-        for t in range(timesteps - 1, -1, -1):
+        x = torch.randn(1, channels, image_size, image_size, device=device)  # x_T 샘플링
+        for t in range(timesteps, 0, -1):
+            t_index = t - 1  # 0부터 시작하는 인덱스로 조정
             t_tensor = torch.full((1,), t, device=device).long()
-            beta_t = (
-                scheduler[t]
-                .unsqueeze(0)
-                .unsqueeze(1)
-                .expand(1, channels, image_size, image_size)
-            )
-            noise_pred = model(x, t_tensor)
-            x = x - beta_t * noise_pred
-            x = x / torch.sqrt(1 - beta_t)
-        x = torch.clamp(x, 0, 1)
+            alpha_t = scheduler[t_index]
+            alpha_t = alpha_t.view(-1, 1, 1, 1).to(x.device)
+            sqrt_recip_alpha_t = 1 / torch.sqrt(alpha_t)
+            sqrt_one_minus_alpha_bar = torch.sqrt(1 - scheduler[:t_index+1].cumprod(dim=0))[-1]
+
+            # t > 1 인 경우 z를 샘플링하고 그렇지 않으면 z = 0
+            if t > 1:
+                z = torch.randn_like(x)
+            else:
+                z = torch.zeros_like(x)
+
+            beta_t = scheduler[t_index]
+            sigma_t = torch.sqrt(beta_t)
+            epsilon_theta = model(x, t_tensor)
+            x = sqrt_recip_alpha_t * (x - (1 - alpha_t) / sqrt_one_minus_alpha_bar * epsilon_theta) + sigma_t * z
+        
+        x = torch.clamp(x, -1, 1)  # Normalize to [-1, 1]
         return x
+    
+def add_noise(x_0, timesteps, scheduler):
+    x_t = x_0
+    for t in range(timesteps, 0, -1):
+        noise = torch.randn_like(x_0)
+        alpha_t = scheduler[t-1]
+        x_t = torch.sqrt(alpha_t) * x_t + torch.sqrt(1 - alpha_t) * noise
+    return x_t
+
+def validate(model, x_t, timesteps, scheduler, device):
+    model.eval()
+    with torch.no_grad():
+        for t in range(timesteps, 0, -1):
+            t_index = t - 1
+            t_tensor = torch.full((1,), t, device=device).long()
+            alpha_t = scheduler[t_index]
+            alpha_t = alpha_t.view(-1, 1, 1, 1).to(x_t.device)
+            sqrt_recip_alpha_t = 1 / torch.sqrt(alpha_t)
+            sqrt_one_minus_alpha_bar = torch.sqrt(1 - scheduler[:t_index+1].cumprod(dim=0))[-1]
+            if t > 1:
+                z = torch.randn_like(x_t)
+            else:
+                z = torch.zeros_like(x_t)
+            beta_t = scheduler[t_index]
+            sigma_t = torch.sqrt(beta_t)
+            epsilon_theta = model(x_t, t_tensor)
+            x_t = sqrt_recip_alpha_t * (x_t - (1 - alpha_t) / sqrt_one_minus_alpha_bar * epsilon_theta) + sigma_t * z
+        x_t = torch.clamp(x_t, -1, 1)
+        return x_t
 
 
 def main():
     # 하이퍼파라미터 설정
-    image_size = 128
+    image_size = 32
     channels = 3
     batch_size = 64
-    num_epochs = 50
-    learning_rate = 0.0003
+    num_epochs = 200
+    learning_rate = 0.0001
     beta1 = 0.0001
     beta2 = 0.02
-    timesteps = 4000
+    timesteps = 1000
     model_save_path = "./ddpm_unet.pth"
 
     if torch.backends.mps.is_available():
@@ -223,7 +233,7 @@ def main():
         root="./cifar10/train", train=True, download=True, transform=transform
     )
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=10
+        dataset, batch_size=batch_size, shuffle=True, num_workers=6
     )
 
     model = UNet(channels, embed_dim=512).to(device)
