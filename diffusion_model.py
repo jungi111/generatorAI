@@ -163,6 +163,11 @@ def sample(model, image_size, channels, timesteps, device, scheduler):
             sigma_t = torch.sqrt(beta_t)
             epsilon_theta = model(x, t_tensor)
             x = sqrt_recip_alpha_t * (x - (1 - alpha_t) / sqrt_one_minus_alpha_bar * epsilon_theta) + sigma_t * z
+            
+            # 중간 결과를 출력하여 디버깅
+            if t % 100 == 0 or t == 1:  # 100 단계마다 출력, 마지막 단계도 포함
+                print(f"Step {t}, x mean: {x.mean().item()}, x std: {x.std().item()}")
+        
         
         x = torch.clamp(x, -1, 1)  # Normalize to [-1, 1]
         return x
@@ -240,6 +245,12 @@ def main():
     model = UNet(channels, embed_dim=512).to(device)
     optimizer = optim.Adam(model.parameters(), lr=learning_rate)
     scheduler = linear_beta_schedule(timesteps, beta1, beta2).to(device)
+    
+    # 스케줄러 값 확인
+    print("Scheduler values:")
+    print(scheduler)
+    
+    
     train(
         model,
         dataloader,
