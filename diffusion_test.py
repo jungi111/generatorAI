@@ -3,11 +3,12 @@ import torch.nn as nn
 import torch.optim as optim
 import torchvision
 import torchvision.transforms as transforms
-from torchvision.utils import make_grid
+from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
+import os
 
 
 class DoubleConv(nn.Module):
@@ -31,12 +32,35 @@ class DoubleConv(nn.Module):
             return self.double_conv(x)
 
 
+class SelfAttention(nn.Module):
+    def __init__(self, in_channels):
+        super(SelfAttention, self).__init__()
+        self.query_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.key_conv = nn.Conv2d(in_channels, in_channels // 8, kernel_size=1)
+        self.value_conv = nn.Conv2d(in_channels, in_channels, kernel_size=1)
+        self.gamma = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x):
+        batch_size, C, width, height = x.size()
+        query = self.query_conv(x).view(batch_size, -1, width * height).permute(0, 2, 1)
+        key = self.key_conv(x).view(batch_size, -1, width * height)
+        attention = torch.bmm(query, key)
+        attention = F.softmax(attention, dim=-1)
+        value = self.value_conv(x).view(batch_size, -1, width * height)
+        out = torch.bmm(value, attention.permute(0, 2, 1))
+        out = out.view(batch_size, C, width, height)
+        out = self.gamma * out + x
+        return out
+
+
 class Down(nn.Module):
-    def __init__(self, in_channels, out_channels, emb_dim=512):
+    def __init__(self, in_channels, out_channels, emb_dim=512, device="cuda"):
         super().__init__()
+        self.device = device
         self.maxpool_conv = nn.Sequential(
             nn.MaxPool2d(2),
             DoubleConv(in_channels, in_channels, residual=True),
+            SelfAttention(in_channels),  # Add Self-Attention
             DoubleConv(in_channels, out_channels),
         )
 
@@ -47,17 +71,18 @@ class Down(nn.Module):
 
     def forward(self, x, t):
         x = self.maxpool_conv(x)
-        emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
+        emb = self.emb_layer(t).to(self.device)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
         return x + emb
 
 
 class Up(nn.Module):
-    def __init__(self, in_channels, out_channels, emb_dim=512):
+    def __init__(self, in_channels, out_channels, emb_dim=512, device="cuda"):
         super().__init__()
-
+        self.device = device
         self.up = nn.Upsample(scale_factor=2, mode="bilinear", align_corners=True)
         self.conv = nn.Sequential(
             DoubleConv(in_channels, in_channels, residual=True),
+            SelfAttention(in_channels),  # Add Self-Attention
             DoubleConv(in_channels, out_channels, in_channels // 2),
         )
 
@@ -70,7 +95,7 @@ class Up(nn.Module):
         x = self.up(x)
         x = torch.cat([skip_x, x], dim=1)
         x = self.conv(x)
-        emb = self.emb_layer(t)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
+        emb = self.emb_layer(t).to(self.device)[:, :, None, None].repeat(1, 1, x.shape[-2], x.shape[-1])
         output = x + emb
         return output
 
@@ -81,17 +106,17 @@ class UNet(nn.Module):
         self.device = device
         self.time_dim = time_dim
         self.inc = DoubleConv(c_in, 64)
-        self.down1 = Down(64, 128)
-        self.down2 = Down(128, 256)
-        self.down3 = Down(256, 256)
+        self.down1 = Down(64, 128, device=device)
+        self.down2 = Down(128, 256, device=device)
+        self.down3 = Down(256, 256, device=device)
 
         self.bot1 = DoubleConv(256, 512)
         self.bot2 = DoubleConv(512, 512)
         self.bot3 = DoubleConv(512, 256)
 
-        self.up1 = Up(512, 256)  # Corrected to match concatenated channels
-        self.up2 = Up(384, 128)  # Corrected to match concatenated channels
-        self.up3 = Up(192, 64)  # Corrected to match concatenated channels
+        self.up1 = Up(512, 256, device=device)  # Corrected to match concatenated channels
+        self.up2 = Up(384, 128, device=device)  # Corrected to match concatenated channels
+        self.up3 = Up(192, 64, device=device)  # Corrected to match concatenated channels
         self.outc = nn.Conv2d(64, c_out, kernel_size=1)
 
     def pos_encoding(self, t, channels):
@@ -99,7 +124,7 @@ class UNet(nn.Module):
             10000
             ** (torch.arange(0, channels, 2, device=self.device).float() / channels)
         )
-        t = t.unsqueeze(-1)  # [batch_size, 1]
+        t = t.unsqueeze(-1).to(self.device)  # [batch_size, 1]
         pos_enc_a = torch.sin(t * inv_freq)
         pos_enc_b = torch.cos(t * inv_freq)
         pos_enc = torch.cat([pos_enc_a, pos_enc_b], dim=-1)
@@ -150,10 +175,8 @@ class GaussianDiffusion(nn.Module):
         return torch.linspace(self.beta_start, self.beta_end, self.noise_steps)
 
     def noise_images(self, x, t):
-        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t])[:, None, None, None]
-        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t])[
-            :, None, None, None
-        ]
+        sqrt_alpha_hat = torch.sqrt(self.alpha_hat[t]).to(self.device)[:, None, None, None]
+        sqrt_one_minus_alpha_hat = torch.sqrt(1 - self.alpha_hat[t]).to(self.device)[:, None, None, None]
         epsilon = torch.randn_like(x)
         return sqrt_alpha_hat * x + sqrt_one_minus_alpha_hat * epsilon, epsilon
 
@@ -161,8 +184,8 @@ class GaussianDiffusion(nn.Module):
         return torch.randint(low=1, high=self.noise_steps, size=(n,))
 
     def forward(self, x, t):
-        noise = torch.randn_like(x)
-        alphas_cumprod_t = self.alpha_hat[t].view(-1, 1, 1, 1)
+        noise = torch.randn_like(x).to(self.device)
+        alphas_cumprod_t = self.alpha_hat[t].view(-1, 1, 1, 1).to(self.device)
         sqrt_alpha_cumprod_t = torch.sqrt(alphas_cumprod_t)
         sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1.0 - alphas_cumprod_t)
         return sqrt_alpha_cumprod_t * x + sqrt_one_minus_alpha_cumprod_t * noise
@@ -174,13 +197,13 @@ class GaussianDiffusion(nn.Module):
             for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
                 t = (torch.ones(n) * i).long().to(self.device)
                 predicted_noise = model(x, t)
-                alpha = self.alpha[t][:, None, None, None]
-                alpha_hat = self.alpha_hat[t][:, None, None, None]
-                beta = self.beta[t][:, None, None, None]
+                alpha = self.alpha[t][:, None, None, None].to(self.device)
+                alpha_hat = self.alpha_hat[t][:, None, None, None].to(self.device)
+                beta = self.beta[t][:, None, None, None].to(self.device)
                 if i > 1:
-                    noise = torch.randn_like(x)
+                    noise = torch.randn_like(x).to(self.device)
                 else:
-                    noise = torch.zeros_like(x)
+                    noise = torch.zeros_like(x).to(self.device)
                 x = (
                     1
                     / torch.sqrt(alpha)
@@ -196,11 +219,17 @@ class GaussianDiffusion(nn.Module):
         return x
 
 
-def train(diffusion, dataloader, optimizer, num_epochs, device):
+def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
     mse = nn.MSELoss()
-    scaler = GradScaler()
+
+    if use_amp:
+        scaler = GradScaler()
 
     diffusion.train()
+    
+    if not os.path.exists('output'):
+        os.makedirs('output')
+
 
     for epoch in range(num_epochs):
         print(f"Starting epoch {epoch}")
@@ -213,20 +242,33 @@ def train(diffusion, dataloader, optimizer, num_epochs, device):
             x_t, noise = diffusion.noise_images(images, t)
 
             optimizer.zero_grad()
-            with autocast():
+            if use_amp:
+                with autocast():
+                    predicted_noise = diffusion.model(x_t, t)
+                    loss = mse(noise, predicted_noise)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
                 predicted_noise = diffusion.model(x_t, t)
                 loss = mse(noise, predicted_noise)
-
-            scaler.scale(loss).backward()
-            scaler.step(optimizer)
-            scaler.update()
+                loss.backward()
+                optimizer.step()
 
             pbar.set_postfix(MSE=loss.item())
 
         print(f"Epoch {epoch}: Loss = {loss.item()}")
+        
+        diffusion.eval()
+        with torch.no_grad():
+            sampled_images = diffusion.sample(diffusion.model, n=16)
+            sampled_images = (sampled_images.cpu().clamp(-1, 1) + 1) / 2
+            save_image(sampled_images, f'output/sample_epoch_{epoch}.png')
+        diffusion.train()
 
-    torch.save(model.state_dict(), "./diffusion_unet.pth")
-    print(f"Model saved to ./diffusion_unet.pth")
+    torch.save(diffusion.model.state_dict(), "./diffusion_unet1.pth")
+    print(f"Model saved to ./diffusion_unet1.pth")
 
     diffusion.eval()
     with torch.no_grad():
@@ -241,16 +283,43 @@ def train(diffusion, dataloader, optimizer, num_epochs, device):
     plt.show()
 
 
+def generate_and_visualize(diffusion, n_samples=16, img_size=64):
+    resize_transform = transforms.Resize((img_size, img_size))
+    diffusion.eval()
+    with torch.no_grad():
+        sampled_images = diffusion.sample(diffusion.model, n=n_samples)
+        sampled_images = torch.stack([resize_transform(img) for img in sampled_images])
+        sampled_images = make_grid(sampled_images.cpu(), nrow=4)
+        sampled_images = sampled_images.permute(1, 2, 0).numpy()
+
+    # Display the collected images
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.imshow(sampled_images)
+    ax.axis("off")
+    plt.show()
+
+
 if __name__ == "__main__":
 
     # Hyperparameters
-    batch_size = 64
-    image_size = 64
+    batch_size = 128
+    image_size = 32
     num_epochs = 300
     learning_rate = 1e-4
+    train_model = True  # Set this to False to load a model and generate images
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Using device: {device}")
+    if torch.backends.mps.is_available():
+        device = torch.device("mps")
+        print("Using device: MPS (Apple Silicon GPU)")
+        use_amp = False
+    elif torch.cuda.is_available():
+        device = torch.device("cuda")
+        print("Using device: CUDA")
+        use_amp = True
+    else:
+        device = torch.device("cpu")
+        print("Using device: CPU")
+        use_amp = False
 
     transform = transforms.Compose(
         [
@@ -272,9 +341,15 @@ if __name__ == "__main__":
     dataset_size = len(dataset)
     print(f"Dataset size: {dataset_size}")
 
-    model = UNet().to(device)
+    model = UNet(device=device).to(device)
     diffusion = GaussianDiffusion(model, device=device, img_size=image_size).to(device)
     optimizer = optim.Adam(diffusion.parameters(), lr=learning_rate)
 
-    print("Starting training loop...")
-    train(diffusion, dataloader, optimizer, num_epochs=num_epochs, device=device)
+    if train_model:
+        print("Starting training loop...")
+        train(diffusion, dataloader, optimizer, num_epochs=num_epochs, device=device, use_amp=use_amp)
+    else:
+        print("Loading saved model...")
+        model.load_state_dict(torch.load("./diffusion_unet1.pth", map_location=device))
+        diffusion.model = model
+        generate_and_visualize(diffusion, n_samples=16, img_size=image_size)
