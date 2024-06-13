@@ -13,6 +13,7 @@ import numpy as np
 import os
 
 
+#두 개의 컨볼루션 레이어와 그룹 정규화(Group Normalization), GELU 활성화 함수를 포함한 이중 컨볼루션 블록. 잔차 연결(residual connection)을 옵션으로 포함
 class DoubleConv(nn.Module):
     def __init__(self, in_channels, out_channels, mid_channels=None, residual=False):
         super().__init__()
@@ -34,6 +35,7 @@ class DoubleConv(nn.Module):
             return self.double_conv(x)
 
 
+#입력 피처 맵의 공간적 관계를 캡처하는 자가 주의(Self-Attention) 메커니즘
 class SelfAttention(nn.Module):
     def __init__(self, in_channels):
         super(SelfAttention, self).__init__()
@@ -55,6 +57,7 @@ class SelfAttention(nn.Module):
         return out
 
 
+#다운샘플링을 수행하며, 맥스 풀링, 이중 컨볼루션, 자가 주의 메커니즘을 포함. 또한 시간 임베딩 레이어를 포함하여 각 레이어에서 시간 정보를 추가
 class Down(nn.Module):
     def __init__(self, in_channels, out_channels, emb_dim=512, device="cuda"):
         super().__init__()
@@ -77,6 +80,7 @@ class Down(nn.Module):
         return x + emb
 
 
+#업샘플링을 수행하며, 이중 컨볼루션, 자가 주의 메커니즘을 포함. 또한 시간 임베딩 레이어를 포함하여 각 레이어에서 시간 정보를 추가
 class Up(nn.Module):
     def __init__(self, in_channels, out_channels, emb_dim=512, device="cuda"):
         super().__init__()
@@ -102,6 +106,7 @@ class Up(nn.Module):
         return output
 
 
+#전체 U-Net 모델로, 인코딩(다운샘플링), 병목, 디코딩(업샘플링) 블록을 포함. 또한 시간 임베딩을 추가하여 각 레이어에서 시간 정보를 반영
 class UNet(nn.Module):
     def __init__(self, c_in=3, c_out=3, time_dim=512, device="cuda"):
         super(UNet, self).__init__()
@@ -151,6 +156,7 @@ class UNet(nn.Module):
         return output
 
 
+#디퓨전 프로세스를 관리하는 클래스. 노이즈 스케줄링, 이미지 노이즈 추가 및 제거, 샘플링 등의 기능을 포함
 class GaussianDiffusion(nn.Module):
     def __init__(
         self,
@@ -226,6 +232,7 @@ class GaussianDiffusion(nn.Module):
         return x
 
 
+#모델 훈련
 def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
     mse = nn.MSELoss()
 
@@ -264,20 +271,13 @@ def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
                 optimizer.step()
 
             pbar.set_postfix(MSE=loss.item())
-            
-            # 중간 결과 시각화 및 저장
-            if i % 50 == 0:
-                intermediate_images = (x_t.clamp(-1, 1) + 1) / 2
-                save_image(intermediate_images, f'output/train_step_{epoch}_{i}.png')
 
         print(f"Epoch {epoch}: Loss = {loss.item()}")
         
-        diffusion.eval()
-        with torch.no_grad():
-            sampled_images = diffusion.sample(diffusion.model, n=16)
-            sampled_images = (sampled_images.cpu().clamp(-1, 1) + 1) / 2
-            save_image(sampled_images, f'output/sample_epoch_{epoch}.png')
-        diffusion.train()
+        # Save model checkpoint
+        checkpoint_path = f'./output/diffusion_unet_epoch_{epoch}.pth'
+        torch.save(diffusion.model.state_dict(), checkpoint_path)
+        print(f"Model checkpoint saved to {checkpoint_path}")
 
     torch.save(diffusion.model.state_dict(), "./diffusion_unet1.pth")
     print(f"Model saved to ./diffusion_unet1.pth")
@@ -295,6 +295,7 @@ def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
     plt.show()
 
 
+#이미지 생성 및 시각화
 def generate_and_visualize(diffusion, n_samples=16, img_size=64):
     resize_transform = transforms.Resize((img_size, img_size))
     diffusion.eval()
