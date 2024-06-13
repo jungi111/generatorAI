@@ -8,6 +8,8 @@ from tqdm import tqdm
 import matplotlib.pyplot as plt
 import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
+from torch.utils.data import Subset
+import numpy as np
 import os
 
 
@@ -114,9 +116,9 @@ class UNet(nn.Module):
         self.bot2 = DoubleConv(512, 512)
         self.bot3 = DoubleConv(512, 256)
 
-        self.up1 = Up(512, 256, device=device)  # Corrected to match concatenated channels
-        self.up2 = Up(384, 128, device=device)  # Corrected to match concatenated channels
-        self.up3 = Up(192, 64, device=device)  # Corrected to match concatenated channels
+        self.up1 = Up(512, 256, device=device)  
+        self.up2 = Up(384, 128, device=device)  
+        self.up3 = Up(192, 64, device=device)  
         self.outc = nn.Conv2d(64, c_out, kernel_size=1)
 
     def pos_encoding(self, t, channels):
@@ -213,6 +215,11 @@ class GaussianDiffusion(nn.Module):
                     )
                     + torch.sqrt(beta) * noise
                 )
+                
+                # 중간 결과 시각화 및 저장
+                if i % 110 == 0:
+                    intermediate_images = (x.clamp(-1, 1) + 1) / 2
+                    save_image(intermediate_images, f'output/sample_step_{i}.png')
         model.train()
         x = (x.clamp(-1, 1) + 1) / 2
         x = (x * 255).type(torch.uint8)
@@ -228,7 +235,7 @@ def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
     diffusion.train()
     
     if not os.path.exists('output'):
-        os.makedirs('output')
+        os.makedirs('output', exist_ok=True)
 
 
     for epoch in range(num_epochs):
@@ -257,6 +264,11 @@ def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
                 optimizer.step()
 
             pbar.set_postfix(MSE=loss.item())
+            
+            # 중간 결과 시각화 및 저장
+            if i % 50 == 0:
+                intermediate_images = (x_t.clamp(-1, 1) + 1) / 2
+                save_image(intermediate_images, f'output/train_step_{epoch}_{i}.png')
 
         print(f"Epoch {epoch}: Loss = {loss.item()}")
         
@@ -302,7 +314,7 @@ def generate_and_visualize(diffusion, n_samples=16, img_size=64):
 if __name__ == "__main__":
 
     # Hyperparameters
-    batch_size = 128
+    batch_size = 64
     image_size = 32
     num_epochs = 300
     learning_rate = 1e-4
@@ -327,15 +339,20 @@ if __name__ == "__main__":
             transforms.RandomHorizontalFlip(),
             transforms.CenterCrop(image_size),
             transforms.ToTensor(),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
         ]
     )
 
     dataset = torchvision.datasets.CIFAR10(
         root="./cifar10/train", train=True, download=True, transform=transform
     )
+    
+    # 10,000개의 데이터만 사용하도록 서브셋 생성
+    indices = np.random.choice(len(dataset), 10000, replace=False)
+    subset_dataset = Subset(dataset, indices)
 
     dataloader = torch.utils.data.DataLoader(
-        dataset, batch_size=batch_size, shuffle=True, num_workers=6, pin_memory=True
+        subset_dataset, batch_size=batch_size, shuffle=True, num_workers=6, pin_memory=True
     )
 
     dataset_size = len(dataset)
@@ -350,6 +367,6 @@ if __name__ == "__main__":
         train(diffusion, dataloader, optimizer, num_epochs=num_epochs, device=device, use_amp=use_amp)
     else:
         print("Loading saved model...")
-        model.load_state_dict(torch.load("./diffusion_unet1.pth", map_location=device))
+        model.load_state_dict(torch.load("./diffusion_unet.pth", map_location=device))
         diffusion.model = model
         generate_and_visualize(diffusion, n_samples=16, img_size=image_size)
