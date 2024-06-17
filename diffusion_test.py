@@ -386,22 +386,8 @@ def train_with_classifier(
         torch.save(diffusion.model.state_dict(), checkpoint_path)
         print(f"Model checkpoint saved to {checkpoint_path}")
 
-    torch.save(diffusion.model.state_dict(), "./diffusion_unet_classifier.pth")
+    torch.save(diffusion.model.state_dict(), "./diffusion_unet_classifier400_32.pth")
     print(f"Model saved to ./diffusion_unet_classifier.pth")
-
-    diffusion.eval()
-    with torch.no_grad():
-        sampled_images = diffusion.sample_with_classifier(
-            diffusion.model, n=16, target_class=0
-        )
-        sampled_images = make_grid(sampled_images.cpu(), nrow=4)
-        sampled_images = sampled_images.permute(1, 2, 0).numpy()
-
-    # Display the collected images
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(sampled_images)
-    ax.axis("off")
-    plt.show()
 
 
 # 모델 훈련
@@ -466,21 +452,16 @@ def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
     plt.show()
 
 
-def generate_with_classifier(
-    diffusion, device, n_samples=16, img_size=32, target_class=None
-):
+def generate_with_classifier(diffusion, n_samples=16, img_size=32, target_class=None):
     resize_transform = transforms.Resize((img_size, img_size))
     diffusion.eval()
     with torch.no_grad():
         sampled_images = diffusion.sample_with_classifier(
             diffusion.model, n=n_samples, target_class=target_class
         )
-        if device == torch.device("mps"):
-            sampled_images = (
-                sampled_images.cpu()
-            )  # Ensure images are on the CPU for resizing
+        sampled_images = sampled_images.cpu()
         sampled_images = torch.stack([resize_transform(img) for img in sampled_images])
-        sampled_images = make_grid(sampled_images, nrow=4)
+        sampled_images = make_grid(sampled_images, nrow=6)
         sampled_images = sampled_images.permute(1, 2, 0).numpy()
 
     # Display the collected images
@@ -514,11 +495,11 @@ def generate_and_visualize(diffusion, device, n_samples=16, img_size=32):
 if __name__ == "__main__":
 
     # Hyperparameters
-    batch_size = 64
+    batch_size = 32
     image_size = 32
-    num_epochs = 500
+    num_epochs = 400
     learning_rate = 1e-4
-    train_model = True  # Set this to False to load a model and generate images
+    train_model = False  # Set this to False to load a model and generate images
 
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -598,7 +579,7 @@ if __name__ == "__main__":
     else:
         print("Loading saved model...")
         model.load_state_dict(
-            torch.load("./diffusion_unet_classifier.pth", map_location=device)
+            torch.load("./diffusion_unet_classifier400_32.pth", map_location=device)
         )
         diffusion.model = model
-        generate_and_visualize(diffusion, device=device, n_samples=16, img_size=256)
+        generate_with_classifier(diffusion, n_samples=36, img_size=256, target_class=1)
