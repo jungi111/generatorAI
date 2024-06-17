@@ -333,6 +333,67 @@ class GaussianDiffusion(nn.Module):
         return x
 
 
+def train_with_classifier(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
+    mse = nn.MSELoss()
+
+    if use_amp:
+        scaler = GradScaler()
+
+    diffusion.train()
+
+    if not os.path.exists("output"):
+        os.makedirs("output", exist_ok=True)
+
+    for epoch in range(num_epochs):
+        print(f"Starting epoch {epoch}")
+        pbar = tqdm(
+            dataloader, desc=f"Epoch {epoch} / {num_epochs}", position=0, leave=True
+        )
+        for i, (images, labels) in enumerate(pbar):
+            images = images.to(device)
+            labels = labels.to(device)  # 레이블도 디바이스로 이동
+            t = diffusion.sample_timesteps(images.shape[0]).to(device)
+            x_t, noise = diffusion.noise_images(images, t)
+
+            optimizer.zero_grad()
+            if use_amp:
+                with autocast():
+                    predicted_noise = diffusion.model(x_t, t, labels)  # 레이블 추가
+                    loss = mse(noise, predicted_noise)
+
+                scaler.scale(loss).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                predicted_noise = diffusion.model(x_t, t, labels)  # 레이블 추가
+                loss = mse(noise, predicted_noise)
+                loss.backward()
+                optimizer.step()
+
+            pbar.set_postfix(MSE=loss.item())
+
+        print(f"Epoch {epoch}: Loss = {loss.item()}")
+
+        # Save model checkpoint
+        checkpoint_path = f"./output/diffusion_unet_classifier_checkpoint_epoch_{epoch}.pth"
+        torch.save(diffusion.model.state_dict(), checkpoint_path)
+        print(f"Model checkpoint saved to {checkpoint_path}")
+
+    torch.save(diffusion.model.state_dict(), "./diffusion_unet_classifier.pth")
+    print(f"Model saved to ./diffusion_unet_classifier.pth")
+
+    diffusion.eval()
+    with torch.no_grad():
+        sampled_images = diffusion.sample_with_classifier(diffusion.model, n=16, target_class=0)
+        sampled_images = make_grid(sampled_images.cpu(), nrow=4)
+        sampled_images = sampled_images.permute(1, 2, 0).numpy()
+
+    # Display the collected images
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
+    ax.imshow(sampled_images)
+    ax.axis("off")
+    plt.show()
+
 # 모델 훈련
 def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
     mse = nn.MSELoss()
@@ -384,7 +445,7 @@ def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
 
     diffusion.eval()
     with torch.no_grad():
-        sampled_images = diffusion.sample_with_classifier(diffusion.model, n=16, target_class= 10)
+        sampled_images = diffusion.sample(diffusion.model, n=16)
         sampled_images = make_grid(sampled_images.cpu(), nrow=4)
         sampled_images = sampled_images.permute(1, 2, 0).numpy()
 
@@ -399,7 +460,7 @@ def generate_with_classifier(diffusion, device, n_samples=16, img_size=32, targe
     resize_transform = transforms.Resize((img_size, img_size))
     diffusion.eval()
     with torch.no_grad():
-        sampled_images = diffusion.sample(diffusion.model, n=n_samples, target_class=target_class)
+        sampled_images = diffusion.sample_with_classifier(diffusion.model, n=n_samples, target_class=target_class)
         if device == torch.device("mps"):
             sampled_images = sampled_images.cpu()  # Ensure images are on the CPU for resizing
         sampled_images = torch.stack([resize_transform(img) for img in sampled_images])
@@ -499,7 +560,15 @@ if __name__ == "__main__":
 
     if train_model:
         print("Starting training loop...")
-        train(
+        # train(
+        #     diffusion,
+        #     dataloader,
+        #     optimizer,
+        #     num_epochs=num_epochs,
+        #     device=device,
+        #     use_amp=use_amp,
+        # )
+        train_with_classifier(
             diffusion,
             dataloader,
             optimizer,
