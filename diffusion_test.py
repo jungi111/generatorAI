@@ -118,17 +118,18 @@ class UNet_classifier(nn.Module):
         super().__init__()
         self.device = device
         self.time_dim = time_dim
-        self.down1 = Down(64, 128, device=device)
-        self.down2 = Down(128, 256, device=device)
-        self.down3 = Down(256, 256, device=device)
+        self.inc = DoubleConv(c_in, 64)
+        self.down1 = Down(64, 128, emb_dim=time_dim, device=device)
+        self.down2 = Down(128, 256, emb_dim=time_dim, device=device)
+        self.down3 = Down(256, 256, emb_dim=time_dim, device=device)
 
         self.bot1 = DoubleConv(256, 512)
         self.bot2 = DoubleConv(512, 512)
         self.bot3 = DoubleConv(512, 256)
 
-        self.up1 = Up(512, 256, device=device)
-        self.up2 = Up(384, 128, device=device)
-        self.up3 = Up(192, 64, device=device)
+        self.up1 = Up(512, 256, emb_dim=time_dim, device=device)
+        self.up2 = Up(384, 128, emb_dim=time_dim, device=device)
+        self.up3 = Up(192, 64, emb_dim=time_dim, device=device)
         self.outc = nn.Conv2d(64, c_out, kernel_size=1)
         
         if num_classes is not None:
@@ -354,6 +355,8 @@ def train_with_classifier(diffusion, dataloader, optimizer, num_epochs, device, 
             labels = labels.to(device)  # 레이블도 디바이스로 이동
             t = diffusion.sample_timesteps(images.shape[0]).to(device)
             x_t, noise = diffusion.noise_images(images, t)
+            if np.random.random() < 0.1:
+                labels = None
 
             optimizer.zero_grad()
             if use_amp:
