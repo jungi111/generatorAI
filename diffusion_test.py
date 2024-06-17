@@ -112,7 +112,59 @@ class Up(nn.Module):
         )
         output = x + emb
         return output
+    
+class UNet_classifier(nn.Module):
+    def __init__(self, c_in=3, c_out=3, time_dim=256, num_classes=None, device="cuda"):
+        super().__init__()
+        self.device = device
+        self.time_dim = time_dim
+        self.down1 = Down(64, 128, device=device)
+        self.down2 = Down(128, 256, device=device)
+        self.down3 = Down(256, 256, device=device)
 
+        self.bot1 = DoubleConv(256, 512)
+        self.bot2 = DoubleConv(512, 512)
+        self.bot3 = DoubleConv(512, 256)
+
+        self.up1 = Up(512, 256, device=device)
+        self.up2 = Up(384, 128, device=device)
+        self.up3 = Up(192, 64, device=device)
+        self.outc = nn.Conv2d(64, c_out, kernel_size=1)
+        
+        if num_classes is not None:
+            self.label_emb = nn.Embedding(num_classes, time_dim)
+            
+    def pos_encoding(self, t, channels):
+        inv_freq = 1.0 / (
+            10000
+            ** (torch.arange(0, channels, 2, device=self.device).float() / channels)
+        )
+        t = t.unsqueeze(-1).to(self.device)  # [batch_size, 1]
+        pos_enc_a = torch.sin(t * inv_freq)
+        pos_enc_b = torch.cos(t * inv_freq)
+        pos_enc = torch.cat([pos_enc_a, pos_enc_b], dim=-1)
+        return pos_enc
+    
+    def forward(self, x, t, y):
+        t = self.pos_encoding(t, self.time_dim)
+        
+        if y is not None:
+            t += self.label_emb(y)
+
+        x1 = self.inc(x)
+        x2 = self.down1(x1, t)
+        x3 = self.down2(x2, t)
+        x4 = self.down3(x3, t)
+
+        x4 = self.bot1(x4)
+        x4 = self.bot2(x4)
+        x4 = self.bot3(x4)
+
+        x = self.up1(x4, x3, t)
+        x = self.up2(x, x2, t)
+        x = self.up3(x, x1, t)
+        output = self.outc(x)
+        return output
 
 # 전체 U-Net 모델로, 인코딩(다운샘플링), 병목, 디코딩(업샘플링) 블록을 포함. 또한 시간 임베딩을 추가하여 각 레이어에서 시간 정보를 반영
 class UNet(nn.Module):
@@ -209,6 +261,43 @@ class GaussianDiffusion(nn.Module):
         sqrt_alpha_cumprod_t = torch.sqrt(alphas_cumprod_t)
         sqrt_one_minus_alpha_cumprod_t = torch.sqrt(1.0 - alphas_cumprod_t)
         return sqrt_alpha_cumprod_t * x + sqrt_one_minus_alpha_cumprod_t * noise
+    
+    def sample_with_classifier(self, model, n, target_class=None):
+        model.eval()
+        with torch.no_grad():
+            x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
+            if target_class is not None:
+                y = torch.tensor([target_class] * n).to(self.device)
+            else:
+                y = None
+            for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
+                t = (torch.ones(n) * i).long().to(self.device)
+                predicted_noise = model(x, t, y)
+                alpha = self.alpha[t][:, None, None, None].to(self.device)
+                alpha_hat = self.alpha_hat[t][:, None, None, None].to(self.device)
+                beta = self.beta[t][:, None, None, None].to(self.device)
+                if i > 1:
+                    noise = torch.randn_like(x).to(self.device)
+                else:
+                    noise = torch.zeros_like(x).to(self.device)
+                x = (
+                    1
+                    / torch.sqrt(alpha)
+                    * (
+                        x
+                        - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise
+                    )
+                    + torch.sqrt(beta) * noise
+                )
+
+                # 중간 결과 시각화 및 저장
+                if i % 110 == 0:
+                    intermediate_images = (x.clamp(-1, 1) + 1) / 2
+                    save_image(intermediate_images, f"output/sample_step_{i}.png")
+        model.train()
+        x = (x.clamp(-1, 1) + 1) / 2
+        x = (x * 255).type(torch.uint8)
+        return x
 
     def sample(self, model, n):
         model.eval()
@@ -286,34 +375,53 @@ def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
         print(f"Epoch {epoch}: Loss = {loss.item()}")
 
         # Save model checkpoint
-        checkpoint_path = f"./output/diffusion_unet_checkpoint.pth"
+        checkpoint_path = f"./output/diffusion_unet_classifier_checkpoint.pth"
         torch.save(diffusion.model.state_dict(), checkpoint_path)
         print(f"Model checkpoint saved to {checkpoint_path}")
 
-    torch.save(diffusion.model.state_dict(), "./diffusion_unet1.pth")
-    print(f"Model saved to ./diffusion_unet1.pth")
+    torch.save(diffusion.model.state_dict(), "./diffusion_unet_classifier.pth")
+    print(f"Model saved to ./diffusion_unet_classifier.pth")
 
     diffusion.eval()
     with torch.no_grad():
-        sampled_images = diffusion.sample(diffusion.model, n=16)
+        sampled_images = diffusion.sample_with_classifier(diffusion.model, n=16, target_class= 10)
         sampled_images = make_grid(sampled_images.cpu(), nrow=4)
         sampled_images = sampled_images.permute(1, 2, 0).numpy()
 
     # Display the collected images
-    fig, ax = plt.subplots(1, 1, figsize=(12, 12))
+    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
     ax.imshow(sampled_images)
     ax.axis("off")
     plt.show()
 
 
+def generate_with_classifier(diffusion, device, n_samples=16, img_size=32, target_class=None):
+    resize_transform = transforms.Resize((img_size, img_size))
+    diffusion.eval()
+    with torch.no_grad():
+        sampled_images = diffusion.sample(diffusion.model, n=n_samples, target_class=target_class)
+        if device == torch.device("mps"):
+            sampled_images = sampled_images.cpu()  # Ensure images are on the CPU for resizing
+        sampled_images = torch.stack([resize_transform(img) for img in sampled_images])
+        sampled_images = make_grid(sampled_images, nrow=4)
+        sampled_images = sampled_images.permute(1, 2, 0).numpy()
+
+    # Display the collected images
+    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
+    ax.imshow(sampled_images)
+    ax.axis("off")
+    plt.show()
+
 # 이미지 생성 및 시각화
-def generate_and_visualize(diffusion, n_samples=16, img_size=32):
+def generate_and_visualize(diffusion, device, n_samples=16, img_size=32):
     resize_transform = transforms.Resize((img_size, img_size))
     diffusion.eval()
     with torch.no_grad():
         sampled_images = diffusion.sample(diffusion.model, n=n_samples)
+        if device == torch.device("mps"):
+            sampled_images = sampled_images.cpu()  # Ensure images are on the CPU for resizing
         sampled_images = torch.stack([resize_transform(img) for img in sampled_images])
-        sampled_images = make_grid(sampled_images.cpu(), nrow=4)
+        sampled_images = make_grid(sampled_images, nrow=4)
         sampled_images = sampled_images.permute(1, 2, 0).numpy()
 
     # Display the collected images
@@ -330,7 +438,7 @@ if __name__ == "__main__":
     image_size = 32
     num_epochs = 300
     learning_rate = 1e-4
-    train_model = False  # Set this to False to load a model and generate images
+    train_model = True  # Set this to False to load a model and generate images
 
     if torch.backends.mps.is_available():
         device = torch.device("mps")
@@ -358,6 +466,16 @@ if __name__ == "__main__":
     dataset = torchvision.datasets.CIFAR10(
         root="./cifar10/train", train=True, download=True, transform=transform
     )
+    
+    # Extract the class names
+    class_names = dataset.classes
+
+    # Number of classes
+    num_classes = len(class_names)
+
+    # Print the results
+    print(f"The CIFAR-10 dataset has {num_classes} classes.")
+    print("The classes are:", class_names)
 
     # 10,000개의 데이터만 사용하도록 서브셋 생성
     indices = np.random.choice(len(dataset), 10000, replace=False)
@@ -374,7 +492,8 @@ if __name__ == "__main__":
     dataset_size = len(dataset)
     print(f"Dataset size: {dataset_size}")
 
-    model = UNet(device=device).to(device)
+    # model = UNet(device=device).to(device)
+    model = UNet_classifier(num_classes=10, device=device).to(device)
     diffusion = GaussianDiffusion(model, device=device, img_size=image_size).to(device)
     optimizer = optim.Adam(diffusion.parameters(), lr=learning_rate)
 
@@ -390,6 +509,6 @@ if __name__ == "__main__":
         )
     else:
         print("Loading saved model...")
-        model.load_state_dict(torch.load("./diffusion_unet1.pth", map_location=device))
+        model.load_state_dict(torch.load("./diffusion_unet_classifier.pth", map_location=device))
         diffusion.model = model
-        generate_and_visualize(diffusion, n_samples=16, img_size=256)
+        generate_and_visualize(diffusion, device=device, n_samples=16, img_size=256)
