@@ -11,6 +11,7 @@ from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Subset
 import numpy as np
 import os
+import clip
 
 
 # 두 개의 컨볼루션 레이어와 그룹 정규화(Group Normalization), GELU 활성화 함수를 포함한 이중 컨볼루션 블록. 잔차 연결(residual connection)을 옵션으로 포함
@@ -169,56 +170,6 @@ class UNet_classifier(nn.Module):
         return output
 
 
-# 전체 U-Net 모델로, 인코딩(다운샘플링), 병목, 디코딩(업샘플링) 블록을 포함. 또한 시간 임베딩을 추가하여 각 레이어에서 시간 정보를 반영
-class UNet(nn.Module):
-    def __init__(self, c_in=3, c_out=3, time_dim=512, device="cuda"):
-        super(UNet, self).__init__()
-        self.device = device
-        self.time_dim = time_dim
-        self.inc = DoubleConv(c_in, 64)
-        self.down1 = Down(64, 128, device=device)
-        self.down2 = Down(128, 256, device=device)
-        self.down3 = Down(256, 256, device=device)
-
-        self.bot1 = DoubleConv(256, 512)
-        self.bot2 = DoubleConv(512, 512)
-        self.bot3 = DoubleConv(512, 256)
-
-        self.up1 = Up(512, 256, device=device)
-        self.up2 = Up(384, 128, device=device)
-        self.up3 = Up(192, 64, device=device)
-        self.outc = nn.Conv2d(64, c_out, kernel_size=1)
-
-    def pos_encoding(self, t, channels):
-        inv_freq = 1.0 / (
-            10000
-            ** (torch.arange(0, channels, 2, device=self.device).float() / channels)
-        )
-        t = t.unsqueeze(-1).to(self.device)  # [batch_size, 1]
-        pos_enc_a = torch.sin(t * inv_freq)
-        pos_enc_b = torch.cos(t * inv_freq)
-        pos_enc = torch.cat([pos_enc_a, pos_enc_b], dim=-1)
-        return pos_enc
-
-    def forward(self, x, t):
-        t = self.pos_encoding(t, self.time_dim)
-
-        x1 = self.inc(x)
-        x2 = self.down1(x1, t)
-        x3 = self.down2(x2, t)
-        x4 = self.down3(x3, t)
-
-        x4 = self.bot1(x4)
-        x4 = self.bot2(x4)
-        x4 = self.bot3(x4)
-
-        x = self.up1(x4, x3, t)
-        x = self.up2(x, x2, t)
-        x = self.up3(x, x1, t)
-        output = self.outc(x)
-        return output
-
-
 # 디퓨전 프로세스를 관리하는 클래스. 노이즈 스케줄링, 이미지 노이즈 추가 및 제거, 샘플링 등의 기능을 포함
 class GaussianDiffusion(nn.Module):
     def __init__(
@@ -292,44 +243,13 @@ class GaussianDiffusion(nn.Module):
                     )
                     + torch.sqrt(beta) * noise
                 )
-
                 # 중간 결과 시각화 및 저장
                 if i % 110 == 0:
                     intermediate_images = (x.clamp(-1, 1) + 1) / 2
                     save_image(intermediate_images, f"output/sample_step_{i}.png")
-        model.train()
-        x = (x.clamp(-1, 1) + 1) / 2
-        x = (x * 255).type(torch.uint8)
-        return x
-
-    def sample(self, model, n):
-        model.eval()
-        with torch.no_grad():
-            x = torch.randn((n, 3, self.img_size, self.img_size)).to(self.device)
-            for i in tqdm(reversed(range(1, self.noise_steps)), position=0):
-                t = (torch.ones(n) * i).long().to(self.device)
-                predicted_noise = model(x, t)
-                alpha = self.alpha[t][:, None, None, None].to(self.device)
-                alpha_hat = self.alpha_hat[t][:, None, None, None].to(self.device)
-                beta = self.beta[t][:, None, None, None].to(self.device)
-                if i > 1:
-                    noise = torch.randn_like(x).to(self.device)
-                else:
-                    noise = torch.zeros_like(x).to(self.device)
-                x = (
-                    1
-                    / torch.sqrt(alpha)
-                    * (
-                        x
-                        - ((1 - alpha) / (torch.sqrt(1 - alpha_hat))) * predicted_noise
-                    )
-                    + torch.sqrt(beta) * noise
-                )
-
-                # 중간 결과 시각화 및 저장
-                if i % 110 == 0:
+                if i == 1:
                     intermediate_images = (x.clamp(-1, 1) + 1) / 2
-                    save_image(intermediate_images, f"output/sample_step_{i}.png")
+                    save_image(intermediate_images, f"output/sample_step_001.png")
         model.train()
         x = (x.clamp(-1, 1) + 1) / 2
         x = (x * 255).type(torch.uint8)
@@ -389,71 +309,41 @@ def train_with_classifier(
     torch.save(diffusion.model.state_dict(), "./diffusion_unet_classifier400_32.pth")
     print(f"Model saved to ./diffusion_unet_classifier.pth")
 
-
-# 모델 훈련
-def train(diffusion, dataloader, optimizer, num_epochs, device, use_amp):
-    mse = nn.MSELoss()
-
-    if use_amp:
-        scaler = GradScaler()
-
-    diffusion.train()
-
-    if not os.path.exists("output"):
-        os.makedirs("output", exist_ok=True)
-
-    for epoch in range(num_epochs):
-        print(f"Starting epoch {epoch}")
-        pbar = tqdm(
-            dataloader, desc=f"Epoch {epoch} / {num_epochs}", position=0, leave=True
-        )
-        for i, (images, _) in enumerate(pbar):
-            images = images.to(device)
-            t = diffusion.sample_timesteps(images.shape[0]).to(device)
-            x_t, noise = diffusion.noise_images(images, t)
-
-            optimizer.zero_grad()
-            if use_amp:
-                with autocast():
-                    predicted_noise = diffusion.model(x_t, t)
-                    loss = mse(noise, predicted_noise)
-
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                predicted_noise = diffusion.model(x_t, t)
-                loss = mse(noise, predicted_noise)
-                loss.backward()
-                optimizer.step()
-
-            pbar.set_postfix(MSE=loss.item())
-
-        print(f"Epoch {epoch}: Loss = {loss.item()}")
-
-        # Save model checkpoint
-        checkpoint_path = f"./output/diffusion_unet_checkpoint.pth"
-        torch.save(diffusion.model.state_dict(), checkpoint_path)
-        print(f"Model checkpoint saved to {checkpoint_path}")
-
-    torch.save(diffusion.model.state_dict(), "./diffusion_unet.pth")
-    print(f"Model saved to ./diffusion_unet.pth")
-
-    diffusion.eval()
+# 텍스트 프롬프트를 받아 해당 클래스의 인덱스를 반환하는 함수
+def get_class_index(prompt, class_names):
+    # CLIP 모델과 전처리기 로드
+    model, preprocess = clip.load("ViT-B/32", device=device)
+    
+    # CIFAR-10 클래스 이름을 텍스트로 인코딩
+    text_inputs = torch.cat([clip.tokenize(f"a photo of a {c}") for c in class_names]).to(device)
+    
+    # 텍스트 인코딩
     with torch.no_grad():
-        sampled_images = diffusion.sample(diffusion.model, n=16)
-        sampled_images = make_grid(sampled_images.cpu(), nrow=4)
-        sampled_images = sampled_images.permute(1, 2, 0).numpy()
+        text_features = model.encode_text(text_inputs)
+    
+    # 프롬프트를 토큰화하고 인코딩
+    text_prompt = clip.tokenize(prompt).to(device)
+    with torch.no_grad():
+        prompt_features = model.encode_text(text_prompt)
+    
+    # 유사도 계산
+    similarities = (prompt_features @ text_features.T).squeeze()
+    best_class = similarities.argmax().item()
+    
+    return best_class
 
-    # Display the collected images
-    fig, ax = plt.subplots(1, 1, figsize=(8, 8))
-    ax.imshow(sampled_images)
-    ax.axis("off")
-    plt.show()
+def generate_with_prompt(diffusion, dataset, class_names, prompt, n_samples=16, img_size=32):
+    target_class = get_class_index(prompt, class_names)
+    
+    original_images = [img for img, label in dataset if label == target_class]
+    original_images = original_images[:n_samples]
+    original_images = torch.stack(original_images).to(diffusion.device)
 
-
-def generate_with_classifier(diffusion, n_samples=16, img_size=32, target_class=None):
     resize_transform = transforms.Resize((img_size, img_size))
+    unnormalize = transforms.Normalize(
+        mean=[-0.5 / 0.5, -0.5 / 0.5, -0.5 / 0.5],
+        std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
+    )
     diffusion.eval()
     with torch.no_grad():
         sampled_images = diffusion.sample_with_classifier(
@@ -464,31 +354,63 @@ def generate_with_classifier(diffusion, n_samples=16, img_size=32, target_class=
         sampled_images = make_grid(sampled_images, nrow=6)
         sampled_images = sampled_images.permute(1, 2, 0).numpy()
 
-    # Display the collected images
-    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-    ax.imshow(sampled_images)
-    ax.axis("off")
+    original_images = original_images.cpu()
+    original_images = torch.stack([resize_transform(img) for img in original_images])
+    original_images = torch.stack([unnormalize(img) for img in original_images])
+    original_images = make_grid(original_images, nrow=6)
+    original_images = original_images.permute(1, 2, 0).numpy()
+
+    fig, axes = plt.subplots(2, 1, figsize=(6, 12))
+
+    axes[0].imshow(original_images)
+    axes[0].axis("off")
+    axes[0].set_title("Original Images")
+
+    axes[1].imshow(sampled_images)
+    axes[1].axis("off")
+    axes[1].set_title("Generated Images")
+
     plt.show()
 
+def generate_with_classifier(diffusion, dataset, n_samples=16, img_size=32, target_class=None):
+    # CIFAR-10 데이터셋에서 target_class에 해당하는 원본 이미지를 선택
+    original_images = [img for img, label in dataset if label == target_class]
+    original_images = original_images[:n_samples]  # 선택한 이미지를 n_samples 만큼 제한
+    original_images = torch.stack(original_images).to(diffusion.device)
 
-# 이미지 생성 및 시각화
-def generate_and_visualize(diffusion, device, n_samples=16, img_size=32):
     resize_transform = transforms.Resize((img_size, img_size))
+    unnormalize = transforms.Normalize(
+        mean=[-0.5 / 0.5, -0.5 / 0.5, -0.5 / 0.5],
+        std=[1 / 0.5, 1 / 0.5, 1 / 0.5]
+    )
     diffusion.eval()
     with torch.no_grad():
-        sampled_images = diffusion.sample(diffusion.model, n=n_samples)
-        if device == torch.device("mps"):
-            sampled_images = (
-                sampled_images.cpu()
-            )  # Ensure images are on the CPU for resizing
+        sampled_images = diffusion.sample_with_classifier(
+            diffusion.model, n=n_samples, target_class=target_class
+        )
+        sampled_images = sampled_images.cpu()
         sampled_images = torch.stack([resize_transform(img) for img in sampled_images])
-        sampled_images = make_grid(sampled_images, nrow=4)
+        sampled_images = make_grid(sampled_images, nrow=6)
         sampled_images = sampled_images.permute(1, 2, 0).numpy()
 
+    # 원본 이미지들을 처리 (역정규화)
+    original_images = original_images.cpu()
+    original_images = torch.stack([resize_transform(img) for img in original_images])
+    original_images = torch.stack([unnormalize(img) for img in original_images])
+    original_images = make_grid(original_images, nrow=6)
+    original_images = original_images.permute(1, 2, 0).numpy()
+
     # Display the collected images
-    fig, ax = plt.subplots(1, 1, figsize=(6, 6))
-    ax.imshow(sampled_images)
-    ax.axis("off")
+    fig, axes = plt.subplots(2, 1, figsize=(6, 12))
+
+    axes[0].imshow(original_images)
+    axes[0].axis("off")
+    axes[0].set_title("Original Images")
+
+    axes[1].imshow(sampled_images)
+    axes[1].axis("off")
+    axes[1].set_title("Generated Images")
+
     plt.show()
 
 
@@ -553,21 +475,12 @@ if __name__ == "__main__":
     dataset_size = len(dataset)
     print(f"Dataset size: {dataset_size}")
 
-    # model = UNet(device=device).to(device)
     model = UNet_classifier(num_classes=10, device=device).to(device)
     diffusion = GaussianDiffusion(model, device=device, img_size=image_size).to(device)
     optimizer = optim.Adam(diffusion.parameters(), lr=learning_rate)
 
     if train_model:
         print("Starting training loop...")
-        # train(
-        #     diffusion,
-        #     dataloader,
-        #     optimizer,
-        #     num_epochs=num_epochs,
-        #     device=device,
-        #     use_amp=use_amp,
-        # )
         train_with_classifier(
             diffusion,
             dataloader,
@@ -582,4 +495,7 @@ if __name__ == "__main__":
             torch.load("./diffusion_unet_classifier400_32.pth", map_location=device)
         )
         diffusion.model = model
-        generate_with_classifier(diffusion, n_samples=36, img_size=256, target_class=1)
+        # generate_with_classifier(diffusion, dataset=dataset, n_samples=36, img_size=256, target_class=1)
+        
+        prompt = "A red car parked on the street"  # 예시 프롬프트
+        generate_with_prompt(diffusion, dataset, class_names, prompt, n_samples=36, img_size=256)
